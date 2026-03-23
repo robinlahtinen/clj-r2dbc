@@ -1,0 +1,3 @@
+{:lint-as
+ {clj-r2dbc/with-conn clojure.core/let
+  clj-r2dbc/with-tx   clojure.core/let}}
