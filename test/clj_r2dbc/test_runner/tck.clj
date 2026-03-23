@@ -4,4 +4,4 @@
 
 (defn -main
   [& args]
-  (apply test-runner/-main (concat ["-n" "clj-r2dbc.tck.r2dbc-tck-test"] args)))
+  (apply test-runner/-main (concat ["-n" "clj-r2dbc.tck.streaming-contract-test"] args)))
