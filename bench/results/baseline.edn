@@ -1,0 +1,145 @@
+{:generated-at "2026-03-23T13:34:10.515134700Z",
+ :results
+ {"bind-params"
+  {:mono-type
+   {:mean-ns 415.74539363484087,
+    :variance-ns 962582.4254421797,
+    :batch-size 33,
+    :num-samples 200},
+   :poly-type
+   {:mean-ns 504.25757575757575,
+    :variance-ns 1142707.7737170688,
+    :batch-size 33,
+    :num-samples 200}},
+  "execute-many"
+  {:execute-many-100
+   {:mean-ns 47493800,
+    :variance-ns 0.0,
+    :batch-size 1,
+    :num-samples 1},
+   :execute-many-1000
+   {:mean-ns 92447200,
+    :variance-ns 0.0,
+    :batch-size 1,
+    :num-samples 1}},
+  "metadata-cache"
+  {:cold-start
+   {:mean-ns 132.56565656565655,
+    :variance-ns 213874.11577706013,
+    :batch-size 125,
+    :num-samples 200},
+   :hot-path
+   {:mean-ns 188.37209302325581,
+    :variance-ns 323451.7766497459,
+    :batch-size 86,
+    :num-samples 200}},
+  "pipeline-fusion"
+  {:unfused-4
+   {:mean-ns 5573.1623931623935,
+    :variance-ns 1.0620078949687203E7,
+    :batch-size 3,
+    :num-samples 200},
+   :fused-4
+   {:mean-ns 4090.0552486187844,
+    :variance-ns 67634.43830570913,
+    :batch-size 2,
+    :num-samples 200},
+   :unfused-16
+   {:mean-ns 15906.091370558375,
+    :variance-ns 3.989312597120068E7,
+    :batch-size 1,
+    :num-samples 200},
+   :fused-16
+   {:mean-ns 13497.959183673469,
+    :variance-ns 1.938666248037682E7,
+    :batch-size 1,
+    :num-samples 200}},
+  "plan-streaming"
+  {:synthetic-fetch-size-1
+   {:mean-ns 225060900,
+    :variance-ns 0.0,
+    :batch-size 1,
+    :num-samples 1},
+   :synthetic-fetch-size-32
+   {:mean-ns 37833500,
+    :variance-ns 0.0,
+    :batch-size 1,
+    :num-samples 1},
+   :synthetic-fetch-size-256
+   {:mean-ns 37495000,
+    :variance-ns 0.0,
+    :batch-size 1,
+    :num-samples 1},
+   :synthetic-chunk-fetch-size-1
+   {:mean-ns 45933200,
+    :variance-ns 0.0,
+    :batch-size 1,
+    :num-samples 1},
+   :synthetic-chunk-fetch-size-32
+   {:mean-ns 6697500, :variance-ns 0.0, :batch-size 1, :num-samples 1},
+   :h2-fetch-size-1
+   {:mean-ns 109109000,
+    :variance-ns 0.0,
+    :batch-size 1,
+    :num-samples 1},
+   :h2-fetch-size-32
+   {:mean-ns 26050300,
+    :variance-ns 0.0,
+    :batch-size 1,
+    :num-samples 1},
+   :h2-fetch-size-256
+   {:mean-ns 16406400,
+    :variance-ns 0.0,
+    :batch-size 1,
+    :num-samples 1}},
+  "row-to-map"
+  {:hundred-rows
+   {:mean-ns 11168.586387434554,
+    :variance-ns 1.260142904381369E7,
+    :batch-size 1,
+    :num-samples 200},
+   :single-row
+   {:mean-ns 103.75063724419198,
+    :variance-ns 240808.38977496166,
+    :batch-size 138,
+    :num-samples 200}}},
+ :assertion-results
+ [{:name "chunk-flow: fetchSize32 throughput >= fetchSize1 * 5",
+   :pass? true,
+   :ratio 6.85826054497947,
+   :message
+   "ratio=6,86 (need >=5.0), chunk-fetch1=45933200ns, chunk-fetch32=6697500ns"}
+  {:name "INFO: synthetic row-by-row fetchSize32 vs fetchSize1",
+   :pass? true,
+   :ratio 5.948720049691411,
+   :message "ratio=5,95, fetch1=225060900ns, fetch32=37833500ns"}
+  {:name "INFO: H2 fetchSize32 throughput vs fetchSize1",
+   :pass? true,
+   :ratio 4.188397062605805,
+   :message "ratio=4,19, fetch1=109109000ns, fetch32=26050300ns"}
+  {:name "row->map: zero vary-meta allocations (non-datafy path)",
+   :pass? true,
+   :ratio nil,
+   :message "Verified: row/row->map does not call vary-meta."}
+  {:name "row->map: 100-row batch O(N) scaling (<60000ns)",
+   :pass? true,
+   :ratio 107.64836423267153,
+   :message
+   "hundred=11169ns (need <60000ns; O(M*N)≈66000+), single=104ns, ratio=107,6"}
+  {:name "pipeline-fusion: sync-fused-4 sub-50μs",
+   :pass? true,
+   :ratio 1.3626129854956008,
+   :message "unfused4=5573ns, fused4=4090ns, ratio=1,36"}
+  {:name "metadata-cache: hot-path sub-microsecond (<1000ns)",
+   :pass? true,
+   :ratio 188.37209302325581,
+   :message "hotPath=188ns (need <1000ns)"}
+  {:name "row-materialization: vary-meta-free (datafy path only)",
+   :pass? true,
+   :ratio nil,
+   :message
+   "Verified: row/row->map does not call vary-meta. vary-meta is confined to datafy-impl/attach-datafiable-meta (REPL-use-only path)."}
+  {:name "execute-each: 1000-param-set throughput sanity gate",
+   :pass? true,
+   :ratio nil,
+   :message "execute-many-1000 mean=92447200ns"}]}
