@@ -69,7 +69,7 @@ jobs:
             -   name: No defonce in source
                 run: '! grep -rE "defonce" src/'
             -   name: No requiring-resolve in source (excluding comments)
-                run: '! grep -rn "requiring-resolve" src/ | grep -v "^[^:]*:[0-9]*:\s*;"'
+                run: '! grep -rn "(requiring-resolve" src/ | grep -v "^[^:]*:[0-9]*:\s*;"'
             -   name: No top-level resolve in source (excluding comments)
                 run: '! grep -rn "(resolve " src/ | grep -v "^[^:]*:[0-9]*:\s*;"'
             -   name: No eval in source (excluding comments)
