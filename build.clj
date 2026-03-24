@@ -108,11 +108,9 @@
                "  [r2dbc/connect r2dbc/execute r2dbc/stream\n"
                "   r2dbc/with-connection r2dbc/with-transaction\n"
                "   row/kebab-maps i/logging-interceptor mw/with-logging])\n"))
-    (b/compile-clj {:basis      (b/create-basis {})
-                    :src-dirs   ["src" consumer-dir]
+    (b/compile-clj {:basis      (b/create-basis {:extra {:paths [consumer-dir]}})
                     :class-dir  class-dir
-                    :ns-compile ['test.aot.consumer]
-                    :sort       :topo})
+                    :ns-compile ['test.aot.consumer]})
     (println "Uberjar check passed: consumer AOT compilation succeeded.")
     (b/delete {:path "target/uberjar-check"}))
   opts)
