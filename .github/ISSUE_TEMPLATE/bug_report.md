@@ -54,7 +54,8 @@ Check your `deps.edn` for version numbers.
 
 ## Error data (if applicable)
 
-If an exception occurred, paste the `ex-data` map here. In a Clojure REPL, `*e` is automatically bound to the last exception. Run `(ex-data *e)` to extract its error data map.
+If an exception occurred, paste the `ex-data` map here. In a Clojure REPL, `*e` is automatically bound to the last
+exception. Run `(ex-data *e)` to extract its error data map.
 
 <details>
 <summary>ex-data from the exception</summary>
