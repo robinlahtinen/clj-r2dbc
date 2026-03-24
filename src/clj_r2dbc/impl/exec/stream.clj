@@ -48,6 +48,7 @@
    (io.r2dbc.spi Connection ConnectionFactory Row)
    (java.util ArrayDeque ArrayList Collection)
    (java.util.concurrent CompletableFuture)
+   (java.util.concurrent.atomic AtomicBoolean)
    (missionary Cancelled)
    (org.reactivestreams Publisher Subscriber Subscription)))
 
@@ -92,11 +93,11 @@
           error-ref                                                           (volatile! nil)
           done-ref                                                            (volatile! false)
           cancel-ref                                                          (volatile! false)
-          term-ref                                                            (volatile! false)
+          ^AtomicBoolean term-ref                                             (AtomicBoolean. false)
           outstanding                                                         (long-array 1)
           signal-terminator!
           (fn signal-term []
-            (when-not @term-ref (vreset! term-ref true) (terminator)))
+            (when (.compareAndSet term-ref false true) (terminator)))
           subscriber
           (reify
             Subscriber
@@ -202,11 +203,11 @@
           error-ref                                                           (volatile! nil)
           done-ref                                                            (volatile! false)
           cancel-ref                                                          (volatile! false)
-          term-ref                                                            (volatile! false)
+          ^AtomicBoolean term-ref                                             (AtomicBoolean. false)
           outstanding                                                         (long-array 1)
           signal-terminator!
           (fn signal-term []
-            (when-not @term-ref (vreset! term-ref true) (terminator)))
+            (when (.compareAndSet term-ref false true) (terminator)))
           subscriber
           (reify
             Subscriber
