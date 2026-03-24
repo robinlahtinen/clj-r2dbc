@@ -20,6 +20,8 @@
         and pass them to impl/sql/row's row->map before the next row arrives.
 
   This namespace is an implementation detail; do not use from application code."
+  (:require
+   [clj-r2dbc.impl.sql.row])
   (:import
    (clj_r2dbc.impl.sql.row RowMetadataCache)
    (io.r2dbc.spi Row)
