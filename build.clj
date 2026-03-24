@@ -18,8 +18,7 @@
 (def version "0.1.0")
 
 (defn- run-command
-  "Run a command line process and throw if it fails.
-  Use for aliases whose behavior depends on CLI-level -M dispatch and :main-opts."
+  "Run a command line process and throw if it fails."
   [{:keys [command-args error-message]}]
   (let [{:keys [exit]} (b/process {:command-args command-args})]
     (when-not (zero? exit) (throw (ex-info error-message {})))))
@@ -107,7 +106,7 @@
                "            [clj-r2dbc.middleware :as mw]))\n"
                "(defn consumer-fn []\n"
                "  [r2dbc/connect r2dbc/execute r2dbc/stream\n"
-               "   r2dbc/with-conn r2dbc/with-tx\n"
+               "   r2dbc/with-connection r2dbc/with-transaction\n"
                "   row/kebab-maps i/logging-interceptor mw/with-logging])\n"))
     (b/compile-clj {:basis      (b/create-basis {})
                     :src-dirs   ["src" consumer-dir]
@@ -139,17 +138,9 @@
   Uses Clojure exec to invoke the :exec-fn declared in the :bench alias,
   which ensures :jvm-opts (Criterium blackhole, heap sizing) are respected."
   [opts]
-  (let [basis          (b/create-basis {:aliases [:bench]})
-        cmds           (b/java-command {:basis     basis
-                                        :main      'clojure.main
-                                        :main-args ["-e"
-                                                    (str
-                                                     "(require 'clj-r2dbc.bench.runner)"
-                                                     "(clj-r2dbc.bench.runner/run "
-                                                     (pr-str (select-keys opts [:only]))
-                                                     ")")]})
-        {:keys [exit]} (b/process cmds)]
-    (when-not (zero? exit) (throw (ex-info "Benchmarks failed" {}))))
+  (run-command {:command-args  (cond-> ["clojure" "-X:bench"]
+                                 (:only opts) (into [":only" (pr-str (:only opts))]))
+                :error-message "Benchmarks failed"})
   opts)
 
 (defn docs
@@ -210,7 +201,6 @@
 (defn- jar-opts
   [opts]
   (let [v (get-version opts)]
-    (println "\nVersion:" v)
     (assoc opts
            :lib lib
            :version v
@@ -227,10 +217,11 @@
   [opts]
   (b/delete {:path "target"})
   (let [opts (jar-opts opts)]
+    (println "\nVersion:" (:version opts))
     (println "\nWriting pom.xml...")
     (b/write-pom opts)
     (println "\nCopying source...")
-    (b/copy-dir {:src-dirs ["resources" "src"], :target-dir class-dir})
+    (b/copy-dir {:src-dirs ["src"] :target-dir class-dir})
     (println "\nBuilding JAR..." (:jar-file opts))
     (b/jar opts)
     (println "\nVerifying source-only JAR...")
@@ -240,19 +231,19 @@
 (defn ci
   "Build the JAR for deployment. Does not run tests; use test-all for that."
   [opts]
-  (build-jar opts)
-  opts)
+  (build-jar opts))
 
 (defn install
-  "Install the JAR locally."
+  "Install the JAR locally. Run build-jar first."
   [opts]
-  (let [opts (jar-opts opts)] (b/install opts))
+  (let [opts (jar-opts opts)]
+    (b/install opts))
   opts)
 
 (defn deploy
-  "Deploy the JAR to Clojars."
+  "Deploy the JAR to Clojars. Run build-jar first."
   [opts]
-  (let [{:keys [jar-file], :as opts} (jar-opts opts)]
+  (let [{:keys [jar-file] :as opts} (jar-opts opts)]
     (dd/deploy {:installer :remote
                 :artifact  (b/resolve-path jar-file)
                 :pom-file  (b/pom-path (select-keys opts [:lib :class-dir]))}))
