@@ -67,7 +67,7 @@
                         :output-path  "target/docs"
                         :doc-paths    ["doc"]
                         :source-uri   "https://github.com/robinlahtinen/clj-r2dbc/blob/main/{filepath}#L{line}"
-                        :metadata     {:doc/format :markdown}}}
+                        :metadata     {:doc/format :plaintext}}}
   :nrepl  {:extra-paths ["test"]
            :extra-deps  {nrepl/nrepl {:mvn/version "1.6.0"}}
            :main-opts   ["-m" "nrepl.cmdline" "--port" "7888"]}}}
