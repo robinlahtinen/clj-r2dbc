@@ -1,0 +1,26 @@
+name: Outdated dependencies
+
+permissions:
+    contents: read
+
+on:
+    push:
+        branches: [ "main" ]
+    schedule:
+        -   cron: '0 21 * * *'
+
+concurrency:
+    group: ${{ github.workflow }}-${{ github.ref }}
+    cancel-in-progress: true
+
+jobs:
+    antq:
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+        steps:
+            -   name: Checkout
+                uses: actions/checkout@0c366fd6a839edf440554fa01a7085ccba70ac98 # v6.0.2
+                with:
+                    fetch-depth: 1
+            -   name: Check for outdated dependencies
+                uses: liquidz/antq-action@38f06c10868db5394bf46d3fe938bb027acd7272

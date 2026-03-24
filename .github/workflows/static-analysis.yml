@@ -1,0 +1,93 @@
+name: Static analysis
+
+on:
+    push:
+        branches: [ "main" ]
+    pull_request:
+        branches: [ "main" ]
+
+permissions:
+    checks: write
+    contents: read
+
+concurrency:
+    group: ${{ github.workflow }}-${{ github.ref }}
+    cancel-in-progress: true
+
+jobs:
+    lint:
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+        steps:
+            -   name: Checkout
+                uses: actions/checkout@0c366fd6a839edf440554fa01a7085ccba70ac98 # v6.0.2
+                with:
+                    fetch-depth: 1
+            -   name: Lint with clj-kondo
+                uses: DeLaGuardo/clojure-lint-action@2d6013175031096ae07bc9b90a07173029ad7dc9
+                with:
+                    clj-kondo-args: --lint src test bench
+                    github_token: ${{ secrets.GITHUB_TOKEN }}
+    format:
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+        steps:
+            -   name: Checkout
+                uses: actions/checkout@0c366fd6a839edf440554fa01a7085ccba70ac98 # v6.0.2
+                with:
+                    fetch-depth: 1
+            -   name: Prepare Java
+                uses: actions/setup-java@1d018f9b8b9b505bb578a83b230fabcce01af93b # v5.2.0
+                with:
+                    distribution: "oracle"
+                    java-version: "25"
+            -   name: Install Clojure tools
+                uses: DeLaGuardo/setup-clojure@02f5a82b79a547523e664fe8a7a32ea14884d7b2 # 13.6.0
+                with:
+                    cli: latest
+            -   name: Cache Clojure dependencies
+                uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+                with:
+                    path: |
+                        ~/.m2/repository
+                        ~/.gitlibs
+                        ~/.deps.clj
+                    key: ${{ runner.os }}-cljdeps-${{ hashFiles('deps.edn') }}
+                    restore-keys: ${{ runner.os }}-cljdeps-
+            -   name: Check formatting
+                run: clojure -T:format check
+    aot-safety:
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+        steps:
+            -   name: Checkout
+                uses: actions/checkout@0c366fd6a839edf440554fa01a7085ccba70ac98 # v6.0.2
+                with:
+                    fetch-depth: 1
+            -   name: No gen-class in source
+                run: '! grep -rE "gen-class" src/'
+            -   name: No defonce in source
+                run: '! grep -rE "defonce" src/'
+            -   name: No requiring-resolve in source (excluding comments)
+                run: '! grep -rn "requiring-resolve" src/ | grep -v "^[^:]*:[0-9]*:\s*;"'
+            -   name: No top-level resolve in source (excluding comments)
+                run: '! grep -rn "(resolve " src/ | grep -v "^[^:]*:[0-9]*:\s*;"'
+            -   name: No eval in source (excluding comments)
+                run: '! grep -rn "(eval " src/ | grep -v "^[^:]*:[0-9]*:\s*;"'
+            -   name: All source files have warn-on-reflection
+                run: |
+                    total=$(find src -name "*.clj" | wc -l)
+                    found=$(grep -rl "warn-on-reflection" src/ | wc -l)
+                    if [ "$total" -ne "$found" ]; then
+                      echo "FAIL: $found/$total files have warn-on-reflection"
+                      exit 1
+                    fi
+                    echo "PASS: $found/$total files have warn-on-reflection"
+            -   name: Enforce keyword namespace convention
+                run: |
+                    BANNED=$(grep -rn ':r2dbc/rows\|:r2dbc/update-count\|:r2dbc/update-counts\|:r2dbc/results' src/ || true)
+                    if [ -n "$BANNED" ]; then
+                      echo "Namespace drift detected in src/:"
+                      echo "$BANNED"
+                      exit 1
+                    fi

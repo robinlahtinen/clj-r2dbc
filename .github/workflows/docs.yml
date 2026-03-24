@@ -1,0 +1,64 @@
+name: Documentation
+
+on:
+    push:
+        branches: [ "main" ]
+    workflow_dispatch:
+
+permissions:
+    contents: read
+    pages: write
+    id-token: write
+
+concurrency:
+    group: "pages"
+    cancel-in-progress: false
+
+jobs:
+    build-and-deploy:
+        environment:
+            name: github-pages
+            url: ${{ steps.deployment.outputs.page_url }}
+        runs-on: ubuntu-latest
+        timeout-minutes: 15
+        steps:
+            -   name: Checkout
+                uses: actions/checkout@0c366fd6a839edf440554fa01a7085ccba70ac98 # v6.0.2
+                with:
+                    fetch-depth: 1
+
+            -   name: Prepare Java
+                uses: actions/setup-java@1d018f9b8b9b505bb578a83b230fabcce01af93b # v5.2.0
+                with:
+                    distribution: "oracle"
+                    java-version: "25"
+
+            -   name: Install Clojure tools
+                uses: DeLaGuardo/setup-clojure@02f5a82b79a547523e664fe8a7a32ea14884d7b2 # 13.6.0
+                with:
+                    cli: latest
+
+            -   name: Cache Clojure dependencies
+                uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+                with:
+                    path: |
+                        ~/.m2/repository
+                        ~/.gitlibs
+                        ~/.deps.clj
+                    key: ${{ runner.os }}-cljdeps-${{ hashFiles('deps.edn') }}
+                    restore-keys: ${{ runner.os }}-cljdeps-
+
+            -   name: Generate API documentation
+                run: clojure -T:build docs
+
+            -   name: Setup GitHub Pages
+                uses: actions/configure-pages@d5606572c479bee637007364c6b4800ac4fc8573 # v5.0.0
+
+            -   name: Upload artifact
+                uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4.0.0
+                with:
+                    path: "target/docs"
+
+            -   name: Deploy to GitHub Pages
+                id: deployment
+                uses: actions/deploy-pages@854d7aa1b99e4509c4d1b53d69b7ba4eaf39215a # v4.0.5
