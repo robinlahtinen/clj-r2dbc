@@ -200,6 +200,20 @@
           (str "Property failed after " (:num-tests result)
                " tests. Shrunk: " (pr-str (:shrunk result)))))))
 
+(deftest ^:tck deterministic-backpressure-regression-test
+  (testing
+   "stream with n-rows=0 fetch-sz=61 returns exactly 3 seed rows (regression: volatile TOCTOU in lifecycle)"
+    (fx/reset-people-table! tck-db)
+    (let [counted (db/run-task! (m/reduce (fn [acc _] (inc acc))
+                                          0
+                                          (r2dbc/stream
+                                           tck-db
+                                           "SELECT id FROM people ORDER BY id"
+                                           {:params     []
+                                            :builder    (row/make-row-fn)
+                                            :fetch-size 61})))]
+      (is (= 3 counted)))))
+
 (deftest ^:tck stochastic-early-termination-property-test
   (testing
    "stream with early reduced returns correct count across random parameters"
