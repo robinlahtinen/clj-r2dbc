@@ -52,26 +52,26 @@
   ([db sql params opts row-xf row-flow-fn]
    (let [fetch-size (pub/resolve-fetch-size opts)]
      (fn [notifier terminator]
-       (let [state                                                        (Object.)
-             owns-conn?                                                   (not (instance? Connection db))
-             conn-ref                                                     (volatile! nil)
-             conn-sub-ref                                                 (volatile! nil)
-             result-sub-ref                                               (volatile! nil)
-             process-ref                                                  (volatile! nil)
-             init-error-ref                                               (volatile! nil)
-             cancel-ref                                                   (volatile! false)
-             ^AtomicBoolean term-ref                                      (AtomicBoolean. false)
-             init-latch                                                   (CountDownLatch. 1)
+       (let [state                                                       (Object.)
+             owns-conn?                                                  (not (instance? Connection db))
+             conn-ref                                                    (volatile! nil)
+             conn-sub-ref                                                (volatile! nil)
+             result-sub-ref                                              (volatile! nil)
+             process-ref                                                 (volatile! nil)
+             init-error-ref                                              (volatile! nil)
+             cancel-ref                                                  (volatile! false)
+             ^AtomicBoolean term-ref                                     (AtomicBoolean. false)
+             init-latch                                                  (CountDownLatch. 1)
              signal-terminator!
              (fn signal-terminator []
                (when (.compareAndSet term-ref false true) (terminator)))
-             close-owned-conn!                                            (fn close-owned-conn []
-                                                                            (when (and owns-conn? @conn-ref)
-                                                                              (pub/await-void-pub! (.close ^Connection
-                                                                                                    @conn-ref))))
-             wrapped-terminator                                           (fn wrapped-terminator []
-                                                                            (close-owned-conn!)
-                                                                            (signal-terminator!))]
+             close-owned-conn!                                           (fn close-owned-conn []
+                                                                           (when (and owns-conn? @conn-ref)
+                                                                             (pub/await-void-pub! (.close ^Connection
+                                                                                                   @conn-ref))))
+             wrapped-terminator                                          (fn wrapped-terminator []
+                                                                           (close-owned-conn!)
+                                                                           (signal-terminator!))]
          (CompletableFuture/runAsync
           (fn []
             (try (let [^Connection c (if owns-conn?
