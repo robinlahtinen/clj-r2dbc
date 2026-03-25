@@ -20,6 +20,7 @@
    (clojure.lang IDeref IFn)
    (io.r2dbc.spi Connection ConnectionFactory Statement)
    (java.util.concurrent CompletableFuture CountDownLatch)
+   (java.util.concurrent.atomic AtomicBoolean)
    (missionary Cancelled)
    (org.reactivestreams Publisher Subscription)))
 
@@ -59,11 +60,11 @@
              process-ref                                                  (volatile! nil)
              init-error-ref                                               (volatile! nil)
              cancel-ref                                                   (volatile! false)
-             term-ref                                                     (volatile! false)
+             ^AtomicBoolean term-ref                                      (AtomicBoolean. false)
              init-latch                                                   (CountDownLatch. 1)
              signal-terminator!
              (fn signal-terminator []
-               (when-not @term-ref (vreset! term-ref true) (terminator)))
+               (when (.compareAndSet term-ref false true) (terminator)))
              close-owned-conn!                                            (fn close-owned-conn []
                                                                             (when (and owns-conn? @conn-ref)
                                                                               (pub/await-void-pub! (.close ^Connection

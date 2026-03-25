@@ -29,6 +29,7 @@
   (:import
    (io.r2dbc.spi Result)
    (java.util.concurrent CompletableFuture ExecutionException)
+   (java.util.concurrent.atomic AtomicBoolean)
    (java.util.function BiFunction)
    (org.reactivestreams Publisher Subscriber Subscription)))
 
@@ -123,14 +124,12 @@
             outer-pending-ref                                                 (volatile! false)
             inner-live-ref                                                    (volatile! false)
             cancelled-ref                                                     (volatile! false)
-            terminal-ref                                                      (volatile! false)
+            ^AtomicBoolean terminal-ref                                       (AtomicBoolean. false)
             complete!                                                         (fn []
-                                                                                (when-not @terminal-ref
-                                                                                  (vreset! terminal-ref true)
+                                                                                (when (.compareAndSet terminal-ref false true)
                                                                                   (.onComplete downstream)))
             fail!                                                             (fn [t]
-                                                                                (when-not @terminal-ref
-                                                                                  (vreset! terminal-ref true)
+                                                                                (when (.compareAndSet terminal-ref false true)
                                                                                   (.onError downstream t)))
             request-next-result!
             (fn []
