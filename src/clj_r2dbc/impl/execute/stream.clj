@@ -43,7 +43,7 @@
    [clj-r2dbc.row :as pub-row]
    [missionary.core :as m])
   (:import
-   (clj_r2dbc.impl.connection.core ConnectableWithOpts)
+   (clj_r2dbc.impl.connection ConnectableWithOpts)
    (clojure.lang IDeref IFn)
    (io.r2dbc.spi Connection ConnectionFactory Row)
    (java.util ArrayDeque ArrayList Collection)

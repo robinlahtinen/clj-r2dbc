@@ -28,7 +28,7 @@
    [clj-r2dbc.impl.validate :as validate]
    [missionary.core :as m])
   (:import
-   (clj_r2dbc.impl.connection.core ConnectableWithOpts)
+   (clj_r2dbc.impl.connection ConnectableWithOpts)
    (io.r2dbc.spi Batch Connection ConnectionFactory R2dbcException Statement)
    (missionary Cancelled)))
 
