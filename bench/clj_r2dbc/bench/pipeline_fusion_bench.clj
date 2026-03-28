@@ -5,7 +5,7 @@
   "Benchmarks for pipeline interceptor fusion at 4 and 16 interceptors."
   (:require
    [clj-r2dbc.bench.util :as bench-util]
-   [clj-r2dbc.impl.exec.pipeline :as pipeline]
+   [clj-r2dbc.impl.execute.pipeline :as pipeline]
    [clj-r2dbc.test-util.db :as db]
    [criterium.bench :as bench]
    [criterium.measured :as measured]
@@ -16,10 +16,10 @@
 (defn- sync-interceptor
   "Return a sync interceptor that bumps :counter in ctx."
   [label]
-  {:name                              label
-   :clj-r2dbc.impl.exec.pipeline/sync true
-   :enter                             (fn [ctx] (update ctx :counter (fnil inc 0)))
-   :leave                             (fn [ctx] (update ctx :counter (fnil inc 0)))})
+  {:name                                 label
+   :clj-r2dbc.impl.execute.pipeline/sync true
+   :enter                                (fn [ctx] (update ctx :counter (fnil inc 0)))
+   :leave                                (fn [ctx] (update ctx :counter (fnil inc 0)))})
 
 (defn- async-interceptor
   "Return an async (non-fused) interceptor that bumps :counter in ctx."

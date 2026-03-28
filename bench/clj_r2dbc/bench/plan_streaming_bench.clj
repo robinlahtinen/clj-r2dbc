@@ -23,7 +23,7 @@
   (:require
    [clj-r2dbc :as r2dbc]
    [clj-r2dbc.bench.util :as bench-util]
-   [clj-r2dbc.impl.exec.stream :as stream]
+   [clj-r2dbc.impl.execute.stream :as stream]
    [clj-r2dbc.impl.sql.row :as row]
    [clj-r2dbc.test-util.db :as db]
    [clj-r2dbc.test-util.mock :as mock]
