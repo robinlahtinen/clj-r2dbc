@@ -1,7 +1,7 @@
 ;;  Copyright (c) Robin Lahtinen and contributors. All rights reserved.
 ;;  Licensed under the MIT License. See LICENSE in the project root for license information.
 
-(ns clj-r2dbc.impl.conn.publisher
+(ns clj-r2dbc.impl.connection.publisher
   "Reactive Streams publisher bridges for clj-r2dbc.
 
   Pure org.reactivestreams interop - zero Missionary dependency in this namespace.

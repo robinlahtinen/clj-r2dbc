@@ -1,7 +1,7 @@
 ;;  Copyright (c) Robin Lahtinen and contributors. All rights reserved.
 ;;  Licensed under the MIT License. See LICENSE in the project root for license information.
 
-(ns clj-r2dbc.impl.exec.core
+(ns clj-r2dbc.impl.execute
   "Core execution layer for clj-r2dbc.
 
   Provides:
@@ -15,9 +15,9 @@
 
   This namespace is an implementation detail; do not use from application code."
   (:require
-   [clj-r2dbc.impl.conn.core :as conn]
+   [clj-r2dbc.impl.connection :as conn]
    [clj-r2dbc.impl.datafy :as datafy-impl]
-   [clj-r2dbc.impl.exec.pipeline :as pipeline]
+   [clj-r2dbc.impl.execute.pipeline :as pipeline]
    [clj-r2dbc.impl.protocols :as proto]
    [clj-r2dbc.impl.sql.error :as error]
    [clj-r2dbc.impl.sql.params :as params]
@@ -28,7 +28,7 @@
    [clj-r2dbc.impl.validate :as validate]
    [missionary.core :as m])
   (:import
-   (clj_r2dbc.impl.conn.core ConnectableWithOpts)
+   (clj_r2dbc.impl.connection.core ConnectableWithOpts)
    (io.r2dbc.spi Batch Connection ConnectionFactory R2dbcException Statement)
    (missionary Cancelled)))
 

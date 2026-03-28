@@ -1,7 +1,7 @@
 ;;  Copyright (c) Robin Lahtinen and contributors. All rights reserved.
 ;;  Licensed under the MIT License. See LICENSE in the project root for license information.
 
-(ns clj-r2dbc.impl.conn.core
+(ns clj-r2dbc.impl.connection
   "Connection lifecycle internals for clj-r2dbc.
 
   Manages connection acquisition and teardown using a RAII pattern:

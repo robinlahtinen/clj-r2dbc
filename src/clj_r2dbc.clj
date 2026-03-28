@@ -22,9 +22,9 @@
     with-conn        - Acquires a connection and binds it for a task (macro).
     with-tx          - Acquires a transaction connection and binds it for a task (macro)."
   (:require
-   [clj-r2dbc.impl.conn.core :as conn]
-   [clj-r2dbc.impl.exec.core]
-   [clj-r2dbc.impl.exec.stream :as stream-impl]
+   [clj-r2dbc.impl.connection :as conn]
+   [clj-r2dbc.impl.execute]
+   [clj-r2dbc.impl.execute.stream :as stream-impl]
    [clj-r2dbc.impl.protocols :as proto]
    [clj-r2dbc.impl.validate :as v]
    [clj-r2dbc.middleware :as middleware]

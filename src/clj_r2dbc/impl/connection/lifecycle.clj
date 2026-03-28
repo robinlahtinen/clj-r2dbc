@@ -1,7 +1,7 @@
 ;;  Copyright (c) Robin Lahtinen and contributors. All rights reserved.
 ;;  Licensed under the MIT License. See LICENSE in the project root for license information.
 
-(ns clj-r2dbc.impl.conn.lifecycle
+(ns clj-r2dbc.impl.connection.lifecycle
   "Connection lifecycle management for streaming plan flows.
 
   When db is a ConnectionFactory: connection is acquired on flow start and
@@ -10,11 +10,11 @@
   Connection.close() is NOT called.
 
   This namespace owns stream connection lifecycle transitions.
-  Flow state machines (r2dbc-row-flow, r2dbc-chunk-flow) live in impl/exec/stream.
+  Flow state machines (r2dbc-row-flow, r2dbc-chunk-flow) live in impl/execute/stream.
 
   This namespace is an implementation detail; do not use from application code."
   (:require
-   [clj-r2dbc.impl.conn.publisher :as pub]
+   [clj-r2dbc.impl.connection.publisher :as pub]
    [clj-r2dbc.impl.sql.statement :as stmt])
   (:import
    (clojure.lang IDeref IFn)

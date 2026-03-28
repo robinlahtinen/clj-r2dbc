@@ -1,7 +1,7 @@
 ;;  Copyright (c) Robin Lahtinen and contributors. All rights reserved.
 ;;  Licensed under the MIT License. See LICENSE in the project root for license information.
 
-(ns clj-r2dbc.impl.exec.stream
+(ns clj-r2dbc.impl.execute.stream
   "Streaming row execution for clj-r2dbc.
 
   Provides:
@@ -34,16 +34,16 @@
 
   This namespace is an implementation detail; do not use from application code."
   (:require
-   [clj-r2dbc.impl.conn.core :as conn]
-   [clj-r2dbc.impl.conn.lifecycle :as lifecycle]
-   [clj-r2dbc.impl.conn.publisher :as pub]
+   [clj-r2dbc.impl.connection :as conn]
+   [clj-r2dbc.impl.connection.lifecycle :as lifecycle]
+   [clj-r2dbc.impl.connection.publisher :as pub]
    [clj-r2dbc.impl.protocols :as proto]
    [clj-r2dbc.impl.sql.cursor :as cursor]
    [clj-r2dbc.impl.sql.row :as row]
    [clj-r2dbc.row :as pub-row]
    [missionary.core :as m])
   (:import
-   (clj_r2dbc.impl.conn.core ConnectableWithOpts)
+   (clj_r2dbc.impl.connection.core ConnectableWithOpts)
    (clojure.lang IDeref IFn)
    (io.r2dbc.spi Connection ConnectionFactory Row)
    (java.util ArrayDeque ArrayList Collection)

@@ -5,8 +5,8 @@
   "Statement preparation utilities for clj-r2dbc.
 
   Provides a single seam for statement creation and option application that is
-  shared between impl/exec/core and impl/conn/lifecycle (streaming). Centralizing
-  these operations here removes duplication between execute and streaming paths.
+  shared between impl/execute/core and impl/connection/lifecycle (streaming).
+  Centralizing these operations here removes duplication between execute and streaming paths.
 
   Provides:
     apply-opts!      - apply :fetch-size and :returning opts to a Statement.
