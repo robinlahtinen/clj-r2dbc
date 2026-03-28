@@ -1,8 +1,8 @@
 ;;  Copyright (c) Robin Lahtinen and contributors. All rights reserved.
 ;;  Licensed under the MIT License. See LICENSE in the project root for license information.
 
-(ns clj-r2dbc.impl.exec.stream-test
-  "Tests for clj-r2dbc.impl.exec.stream streaming flow.
+(ns clj-r2dbc.impl.execute.stream-test
+  "Tests for clj-r2dbc.impl.execute.stream streaming flow.
 
   Uses a real H2 in-memory database because plan* bridges R2DBC Publishers via
   CompletableFuture, which is incompatible with missionary-testkit's virtual
@@ -11,11 +11,11 @@
   Database: r2dbc:h2:mem:///stream-test (shared across tests in this namespace)
   Setup: test_table created once before all tests via use-fixtures :once."
   (:require
-   [clj-r2dbc.impl.conn.core :as conn]
-   [clj-r2dbc.impl.conn.lifecycle :as lifecycle]
-   [clj-r2dbc.impl.conn.publisher :as pub]
+   [clj-r2dbc.impl.connection :as conn]
+   [clj-r2dbc.impl.connection.lifecycle :as lifecycle]
+   [clj-r2dbc.impl.connection.publisher :as pub]
    [clj-r2dbc.impl.datafy :as datafy-impl]
-   [clj-r2dbc.impl.exec.stream :as stream]
+   [clj-r2dbc.impl.execute.stream :as stream]
    [clj-r2dbc.impl.sql.cursor :as cursor]
    [clj-r2dbc.impl.sql.row :as row]
    [clj-r2dbc.impl.util :as util]

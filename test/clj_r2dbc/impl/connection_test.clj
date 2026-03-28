@@ -1,15 +1,15 @@
 ;;  Copyright (c) Robin Lahtinen and contributors. All rights reserved.
 ;;  Licensed under the MIT License. See LICENSE in the project root for license information.
 
-(ns clj-r2dbc.impl.conn.core-test
-  "Tests for clj-r2dbc.impl.conn.core lifecycle functions.
+(ns clj-r2dbc.impl.connection-test
+  "Tests for clj-r2dbc.impl.connection lifecycle functions.
 
   Tests use a mix of:
   - Real H2 in-memory databases for Publisher-based tests (acquire, with-connection)
   - MockConnectionFactory/MockConnection from r2dbc-spi-test for RAII close tracking
   - Plain MockConnection for simple passthrough and metadata tests"
   (:require
-   [clj-r2dbc.impl.conn.core :as conn]
+   [clj-r2dbc.impl.connection :as conn]
    [clj-r2dbc.test-util.db :as db]
    [clj-r2dbc.test-util.mock :as mock]
    [clojure.test :refer [deftest is testing]]

@@ -1,8 +1,8 @@
 ;;  Copyright (c) Robin Lahtinen and contributors. All rights reserved.
 ;;  Licensed under the MIT License. See LICENSE in the project root for license information.
 
-(ns clj-r2dbc.impl.exec.core-test
-  "Tests for clj-r2dbc.impl.exec.core execution layer.
+(ns clj-r2dbc.impl.execute-test
+  "Tests for clj-r2dbc.impl.execute execution layer.
 
   Unit tests use mock objects from clj-r2dbc.test-util.mock.
   All tasks are driven synchronously via db/run-task!.
@@ -12,7 +12,7 @@
   Tests needing update-count segments use raw reify segments instead."
   (:require
    [clj-r2dbc.impl.datafy :as datafy-impl]
-   [clj-r2dbc.impl.exec.core :as execute]
+   [clj-r2dbc.impl.execute :as execute]
    [clj-r2dbc.test-util.db :as db]
    [clj-r2dbc.test-util.mock :as mock]
    [clojure.core.protocols :as core-p]

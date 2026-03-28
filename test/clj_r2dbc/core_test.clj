@@ -4,9 +4,9 @@
 (ns clj-r2dbc.core-test
   (:require
    [clj-r2dbc :as sut]
-   [clj-r2dbc.impl.conn.core :as conn]
-   [clj-r2dbc.impl.exec.core :as execute]
-   [clj-r2dbc.impl.exec.stream :as stream]
+   [clj-r2dbc.impl.connection :as conn]
+   [clj-r2dbc.impl.execute :as execute]
+   [clj-r2dbc.impl.execute.stream :as stream]
    [clj-r2dbc.middleware :as middleware]
    [clj-r2dbc.row :as row]
    [clj-r2dbc.test-util.db :as db]

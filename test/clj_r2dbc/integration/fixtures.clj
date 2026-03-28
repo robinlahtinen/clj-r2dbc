@@ -4,7 +4,7 @@
 (ns clj-r2dbc.integration.fixtures
   (:require
    [clj-r2dbc :as r2dbc]
-   [clj-r2dbc.impl.conn.core :as conn]
+   [clj-r2dbc.impl.connection :as conn]
    [clj-r2dbc.test-util.db :as db]
    [clojure.string :as str]
    [clojure.test :as t]

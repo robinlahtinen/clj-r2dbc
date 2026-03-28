@@ -3,7 +3,7 @@
 
 (ns clj-r2dbc.interceptor-test
   (:require
-   [clj-r2dbc.impl.exec.pipeline :as pipeline]
+   [clj-r2dbc.impl.execute.pipeline :as pipeline]
    [clj-r2dbc.interceptor :as interceptor]
    [clj-r2dbc.test-util.db :as db]
    [clj-r2dbc.test-util.mock :as mock]
