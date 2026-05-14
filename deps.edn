@@ -5,7 +5,7 @@
            :url         "https://github.com/robinlahtinen/clj-r2dbc"
            :license     {:name "MIT License"
                          :url  "https://github.com/robinlahtinen/clj-r2dbc/blob/main/LICENSE"}}
- :deps    {org.clojure/clojure                 {:mvn/version "1.12.4"}
+ :deps    {org.clojure/clojure                 {:mvn/version "1.12.5"}
            io.r2dbc/r2dbc-spi                  {:mvn/version "1.0.0.RELEASE"}
            missionary/missionary               {:mvn/version "b.47"}
            camel-snake-kebab/camel-snake-kebab {:mvn/version "0.4.3"}
@@ -38,7 +38,7 @@
                  io.r2dbc/r2dbc-h2                    {:mvn/version "1.1.0.RELEASE"}
                  com.h2database/h2                    {:mvn/version "2.4.240"}}}
   :bench  {:extra-paths ["bench" "test"]
-           :extra-deps  {criterium/criterium     {:mvn/version "0.5.153-ALPHA"}
+           :extra-deps  {criterium/criterium     {:mvn/version "0.5.243-ALPHA"}
                          io.r2dbc/r2dbc-spi-test {:mvn/version "1.0.0.RELEASE"}
                          io.r2dbc/r2dbc-h2       {:mvn/version "1.1.0.RELEASE"}
                          com.h2database/h2       {:mvn/version "2.4.240"}}
@@ -48,11 +48,11 @@
            :exec-fn     clj-r2dbc.bench.runner/run}
   :build  {:deps       {io.github.clojure/tools.build
                         {:mvn/version "0.10.13"}
-                        slipset/deps-deploy {:mvn/version "0.2.2"}}
+                        slipset/deps-deploy {:mvn/version "0.2.3"}}
            :ns-default build}
-  :lint   {:replace-deps {clj-kondo/clj-kondo {:mvn/version "2026.01.19"}}
+  :lint   {:replace-deps {clj-kondo/clj-kondo {:mvn/version "2026.04.15"}}
            :main-opts    ["-m" "clj-kondo.main" "--lint" "src" "test" "bench" "build.clj"]}
-  :format {:deps       {dev.weavejester/cljfmt {:mvn/version "0.16.3"}}
+  :format {:deps       {dev.weavejester/cljfmt {:mvn/version "0.16.4"}}
            :ns-default cljfmt.tool
            :exec-args  {:paths ["src" "test" "bench" "build.clj"]}}
   :docs   {:extra-deps {codox/codox {:mvn/version "0.10.8"}}
@@ -69,5 +69,5 @@
                         :source-uri   "https://github.com/robinlahtinen/clj-r2dbc/blob/main/{filepath}#L{line}"
                         :metadata     {:doc/format :plaintext}}}
   :nrepl  {:extra-paths ["test"]
-           :extra-deps  {nrepl/nrepl {:mvn/version "1.6.0"}}
+           :extra-deps  {nrepl/nrepl {:mvn/version "1.7.0"}}
            :main-opts   ["-m" "nrepl.cmdline" "--port" "7888"]}}}
