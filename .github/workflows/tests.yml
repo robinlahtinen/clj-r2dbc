@@ -81,3 +81,16 @@ jobs:
 
             -   name: Run tests
                 run: clojure -T:build test-all
+
+            -   name: Run debug TCK (stderr captured for artifact)
+                run: clojure -T:build tck-debug-test 2>tck-debug.log || true
+                continue-on-error: true
+
+            -   name: Upload TCK debug log
+                uses: actions/upload-artifact@v4
+                if: always()
+                with:
+                    name: tck-debug-log-${{ github.sha }}
+                    path: tck-debug.log
+                    retention-days: 14
+                    if-no-files-found: warn

@@ -75,6 +75,15 @@
                 :error-message "TCK tests failed"})
   opts)
 
+(defn tck-debug-test
+  "Run the TCK test scope with extreme debug logging.
+  Uses :debug-tck which sets -Dclj.r2dbc.debug=true and JVM concurrency flags.
+  Stderr is captured by the CI step and uploaded as an artifact."
+  [opts]
+  (run-command {:command-args  ["clojure" "-M:debug-tck"]
+                :error-message "TCK debug tests failed"})
+  opts)
+
 (defn aot-check
   "AOT-compile all source namespaces in a subprocess. Verify that compilation
   succeeds without error. Does not ship compiled artifacts; output is

@@ -34,6 +34,7 @@
 
   This namespace is an implementation detail; do not use from application code."
   (:require
+   [clj-r2dbc.debug-log :as dbg]
    [clj-r2dbc.impl.connection :as conn]
    [clj-r2dbc.impl.connection.lifecycle :as lifecycle]
    [clj-r2dbc.impl.connection.publisher :as pub]
@@ -87,17 +88,20 @@
     row-xf     - 1-arity fn applied to each Row in onNext before buffering."
   [^Publisher row-pub ^long fetch-size row-xf]
   (fn [notifier terminator]
-    (let [state                                                               (Object.)
-          ^ArrayDeque buf                                                     (ArrayDeque. (int fetch-size))
-          sub-ref                                                             (volatile! nil)
-          error-ref                                                           (volatile! nil)
-          done-ref                                                            (volatile! false)
-          cancel-ref                                                          (volatile! false)
-          ^AtomicBoolean term-ref                                             (AtomicBoolean. false)
-          outstanding                                                         (long-array 1)
+    (let [state                                                                     (Object.)
+          flow-id                                                                   (str "RF" (Integer/toHexString (System/identityHashCode state)))
+          ^ArrayDeque buf                                                           (ArrayDeque. (int fetch-size))
+          sub-ref                                                                   (volatile! nil)
+          error-ref                                                                 (volatile! nil)
+          done-ref                                                                  (volatile! false)
+          cancel-ref                                                                (volatile! false)
+          ^AtomicBoolean term-ref                                                   (AtomicBoolean. false)
+          outstanding                                                               (long-array 1)
           signal-terminator!
           (fn signal-term []
-            (when (.compareAndSet term-ref false true) (terminator)))
+            (let [won? (.compareAndSet term-ref false true)]
+              (dbg/dlog flow-id " signal-term won?=" won?)
+              (when won? (terminator))))
           subscriber
           (reify
             Subscriber
@@ -108,6 +112,9 @@
                                    (do (vreset! sub-ref s)
                                        (aset outstanding 0 fetch-size)
                                        false)))]
+                (dbg/dlog flow-id " onSubscribe cancelled?=" cancelled?
+                          " sub=" (Integer/toHexString (System/identityHashCode s))
+                          " fetch-size=" fetch-size)
                 (if cancelled?
                   (.cancel ^Subscription s)
                   (pub/request-async! ^Subscription s fetch-size))))
@@ -121,42 +128,61 @@
                                         0
                                         (unchecked-dec (aget outstanding 0)))
                                   was-empty)))]
+                (dbg/dlog flow-id " onNext notify?=" notify?
+                          " buf-size=" (.size buf)
+                          " outstanding=" (aget outstanding 0))
                 (when notify? (notifier))))
             (onError [_ t]
               (locking state (vreset! error-ref t) (vreset! done-ref true))
+              (dbg/dlog flow-id " onError type=" (.getSimpleName (class t)))
               (notifier))
             (onComplete [_]
               (let [empty?
                     (locking state (vreset! done-ref true) (.isEmpty buf))]
+                (dbg/dlog flow-id " onComplete empty?=" empty?
+                          " buf-size=" (.size buf)
+                          " cancel?=" @cancel-ref)
                 (if empty? (signal-terminator!) (notifier)))))]
       (CompletableFuture/runAsync (fn []
                                     (.subscribe ^Publisher row-pub subscriber)))
       (reify
         IFn
         (invoke [_]
+          (dbg/dlog flow-id " invoke/cancel ENTER term?=" (.get term-ref))
           (let [^Subscription sub (locking state
                                     (vreset! cancel-ref true)
                                     (.clear buf)
                                     @sub-ref)]
             (when sub (.cancel sub))
             (signal-terminator!))
+          (dbg/dlog flow-id " invoke/cancel EXIT")
           nil)
         IDeref
         (deref [_]
-          (let [action (locking state
-                         (cond @cancel-ref [:term nil]
-                               (not (.isEmpty buf))
-                               (let [v (.pollFirst buf)]
-                                 (cond (and (.isEmpty buf) @done-ref)
-                                       (if @error-ref [:last-err v] [:last v])
-                                       (and (.isEmpty buf)
-                                            (zero? (aget outstanding 0)))
-                                       [:req v]
-                                       (not (.isEmpty buf)) [:more v]
-                                       :else [:wait v]))
-                               @error-ref [:err @error-ref]
-                               @done-ref [:term nil]
-                               :else [:wait-empty nil]))]
+          (let [t0     (System/nanoTime)
+                action (locking state
+                         (let [a (cond @cancel-ref [:term nil]
+                                       (not (.isEmpty buf))
+                                       (let [v (.pollFirst buf)]
+                                         (cond (and (.isEmpty buf) @done-ref)
+                                               (if @error-ref [:last-err v] [:last v])
+                                               (and (.isEmpty buf)
+                                                    (zero? (aget outstanding 0)))
+                                               [:req v]
+                                               (not (.isEmpty buf)) [:more v]
+                                               :else [:wait v]))
+                                       @error-ref [:err @error-ref]
+                                       @done-ref [:term nil]
+                                       :else [:wait-empty nil])]
+                           (dbg/dlog flow-id " deref action=" (nth a 0)
+                                     " buf=" (.size buf)
+                                     " cancel?=" @cancel-ref
+                                     " done?=" @done-ref
+                                     " err?=" (some? @error-ref)
+                                     " outstanding=" (aget outstanding 0)
+                                     " term?=" (.get term-ref)
+                                     " lock-ns=" (- (System/nanoTime) t0))
+                           a))]
             (case (nth action 0)
               :term (do (signal-terminator!)
                         (throw (Cancelled. "Row flow terminated.")))
@@ -165,10 +191,13 @@
               :last-err (do (notifier) (nth action 1))
               :more (do (notifier) (nth action 1))
               :wait (nth action 1)
-              :req (let [v                 (nth action 1)
-                         ^Subscription sub (locking state
-                                             (aset outstanding 0 fetch-size)
-                                             @sub-ref)]
+              :req (let [v   (nth action 1)
+                         sub (locking state
+                               (aset outstanding 0 fetch-size)
+                               (dbg/dlog flow-id " deref :req reset outstanding=" fetch-size)
+                               ^Subscription @sub-ref)]
+                     (dbg/dlog flow-id " deref :req requesting fetch-size=" fetch-size
+                               " sub?=" (some? sub))
                      (when sub (pub/request-async! sub fetch-size))
                      v)
               :wait-empty
@@ -197,17 +226,20 @@
   is drained per deref(), the buffer is always empty after each transfer."
   [^Publisher row-pub ^long fetch-size row-xf]
   (fn [notifier terminator]
-    (let [state                                                               (Object.)
-          ^ArrayDeque buf                                                     (ArrayDeque. (int fetch-size))
-          sub-ref                                                             (volatile! nil)
-          error-ref                                                           (volatile! nil)
-          done-ref                                                            (volatile! false)
-          cancel-ref                                                          (volatile! false)
-          ^AtomicBoolean term-ref                                             (AtomicBoolean. false)
-          outstanding                                                         (long-array 1)
+    (let [state                                                                     (Object.)
+          flow-id                                                                   (str "CF" (Integer/toHexString (System/identityHashCode state)))
+          ^ArrayDeque buf                                                           (ArrayDeque. (int fetch-size))
+          sub-ref                                                                   (volatile! nil)
+          error-ref                                                                 (volatile! nil)
+          done-ref                                                                  (volatile! false)
+          cancel-ref                                                                (volatile! false)
+          ^AtomicBoolean term-ref                                                   (AtomicBoolean. false)
+          outstanding                                                               (long-array 1)
           signal-terminator!
           (fn signal-term []
-            (when (.compareAndSet term-ref false true) (terminator)))
+            (let [won? (.compareAndSet term-ref false true)]
+              (dbg/dlog flow-id " signal-term won?=" won?)
+              (when won? (terminator))))
           subscriber
           (reify
             Subscriber
@@ -218,6 +250,9 @@
                                    (do (vreset! sub-ref s)
                                        (aset outstanding 0 fetch-size)
                                        false)))]
+                (dbg/dlog flow-id " onSubscribe cancelled?=" cancelled?
+                          " sub=" (Integer/toHexString (System/identityHashCode s))
+                          " fetch-size=" fetch-size)
                 (if cancelled?
                   (.cancel ^Subscription s)
                   (pub/request-async! ^Subscription s fetch-size))))
@@ -243,12 +278,14 @@
       (reify
         IFn
         (invoke [_]
+          (dbg/dlog flow-id " invoke/cancel ENTER term?=" (.get term-ref))
           (let [^Subscription sub (locking state
                                     (vreset! cancel-ref true)
                                     (.clear buf)
                                     @sub-ref)]
             (when sub (.cancel sub))
             (signal-terminator!))
+          (dbg/dlog flow-id " invoke/cancel EXIT")
           nil)
         IDeref
         (deref [_]
@@ -270,10 +307,13 @@
               :err (do (signal-terminator!) (throw ^Throwable (nth action 1)))
               :last (do (signal-terminator!) (nth action 1))
               :last-err (do (notifier) (nth action 1))
-              :req (let [v                 (nth action 1)
-                         ^Subscription sub (locking state
-                                             (aset outstanding 0 fetch-size)
-                                             @sub-ref)]
+              :req (let [v   (nth action 1)
+                         sub (locking state
+                               (aset outstanding 0 fetch-size)
+                               (dbg/dlog flow-id " deref :req reset outstanding=" fetch-size)
+                               ^Subscription @sub-ref)]
+                     (dbg/dlog flow-id " deref :req requesting fetch-size=" fetch-size
+                               " sub?=" (some? sub))
                      (when sub (pub/request-async! sub fetch-size))
                      v)
               :wait-empty

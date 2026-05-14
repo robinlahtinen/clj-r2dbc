@@ -14,6 +14,7 @@
 
   This namespace is an implementation detail; do not use from application code."
   (:require
+   [clj-r2dbc.debug-log :as dbg]
    [clj-r2dbc.impl.connection.publisher :as pub]
    [clj-r2dbc.impl.sql.statement :as stmt])
   (:import
@@ -52,26 +53,31 @@
   ([db sql params opts row-xf row-flow-fn]
    (let [fetch-size (pub/resolve-fetch-size opts)]
      (fn [notifier terminator]
-       (let [state                                                       (Object.)
-             owns-conn?                                                  (not (instance? Connection db))
-             conn-ref                                                    (volatile! nil)
-             conn-sub-ref                                                (volatile! nil)
-             result-sub-ref                                              (volatile! nil)
-             process-ref                                                 (volatile! nil)
-             init-error-ref                                              (volatile! nil)
-             cancel-ref                                                  (volatile! false)
-             ^AtomicBoolean term-ref                                     (AtomicBoolean. false)
-             init-latch                                                  (CountDownLatch. 1)
+       (let [state                                                    (Object.)
+             lc-id                                                    (str "LC" (Integer/toHexString (System/identityHashCode state)))
+             owns-conn?                                               (not (instance? Connection db))
+             conn-ref                                                 (volatile! nil)
+             conn-sub-ref                                             (volatile! nil)
+             result-sub-ref                                           (volatile! nil)
+             process-ref                                              (volatile! nil)
+             init-error-ref                                           (volatile! nil)
+             cancel-ref                                               (volatile! false)
+             ^AtomicBoolean term-ref                                  (AtomicBoolean. false)
+             init-latch                                               (CountDownLatch. 1)
              signal-terminator!
              (fn signal-terminator []
-               (when (.compareAndSet term-ref false true) (terminator)))
-             close-owned-conn!                                           (fn close-owned-conn []
-                                                                           (when (and owns-conn? @conn-ref)
-                                                                             (pub/await-void-pub! (.close ^Connection
-                                                                                                   @conn-ref))))
-             wrapped-terminator                                          (fn wrapped-terminator []
-                                                                           (close-owned-conn!)
-                                                                           (signal-terminator!))]
+               (let [won? (.compareAndSet term-ref false true)]
+                 (dbg/dlog lc-id " lifecycle signal-term won?=" won?)
+                 (when won? (terminator))))
+             close-owned-conn!                                        (fn close-owned-conn []
+                                                                        (when (and owns-conn? @conn-ref)
+                                                                          (pub/await-void-pub! (.close ^Connection
+                                                                                                @conn-ref))))
+             wrapped-terminator                                       (fn wrapped-terminator []
+                                                                        (dbg/dlog lc-id " wrapped-terminator owns?=" owns-conn?)
+                                                                        (close-owned-conn!)
+                                                                        (signal-terminator!))]
+         (dbg/dlog lc-id " INIT-ASYNC-START cancel?=" @cancel-ref)
          (CompletableFuture/runAsync
           (fn []
             (try (let [^Connection c (if owns-conn?
@@ -80,8 +86,11 @@
                                         conn-sub-ref)
                                        db)
                        _             (vreset! conn-ref c)]
+                   (dbg/dlog lc-id " CONN-ACQUIRED owns?=" owns-conn?
+                             " cancel?=" @cancel-ref)
                    (if @cancel-ref
-                     (do (wrapped-terminator)
+                     (do (dbg/dlog lc-id " CANCEL-PRE-PROCESS")
+                         (wrapped-terminator)
                          (.countDown ^CountDownLatch init-latch))
                      (let [^Statement s                                          (stmt/prepare! c sql params opts)
                            row-pub                                               (pub/result-rows-pub (.execute s)
@@ -92,9 +101,14 @@
                             notifier
                             wrapped-terminator)]
                        (vreset! process-ref process)
+                       (dbg/dlog lc-id " PROCESS-STORED process="
+                                 (Integer/toHexString (System/identityHashCode process)))
                        (.countDown ^CountDownLatch init-latch)
-                       (when @cancel-ref (.invoke ^IFn process)))))
+                       (when @cancel-ref
+                         (dbg/dlog lc-id " CANCEL-POST-LATCH invoking process")
+                         (.invoke ^IFn process)))))
                  (catch Throwable t
+                   (dbg/dlog lc-id " INIT-ERROR " (.getMessage t))
                    (vreset! init-error-ref t)
                    (try (close-owned-conn!) (catch Throwable _))
                    (.countDown ^CountDownLatch init-latch)
@@ -102,10 +116,16 @@
          (reify
            IFn
            (invoke [_]
+             (dbg/dlog lc-id " lifecycle invoke/cancel ENTER"
+                       " process?=" (some? @process-ref)
+                       " term?=" (.get term-ref))
              (let [[process conn-sub result-sub] (locking state
                                                    (vreset! cancel-ref true)
                                                    [@process-ref @conn-sub-ref
                                                     @result-sub-ref])]
+               (dbg/dlog lc-id " lifecycle invoke/cancel LOCKED"
+                         " process?=" (some? process)
+                         " conn-sub?=" (some? conn-sub))
                (when conn-sub (.cancel ^Subscription conn-sub))
                (when result-sub (.cancel ^Subscription result-sub))
                (if process
@@ -115,6 +135,10 @@
              nil)
            IDeref
            (deref [_]
+             (dbg/dlog lc-id " lifecycle deref"
+                       " init-err?=" (some? @init-error-ref)
+                       " process?=" (some? @process-ref)
+                       " cancel?=" @cancel-ref)
              (cond
                @init-error-ref (throw ^Throwable @init-error-ref)
                @process-ref (.deref ^IDeref @process-ref)
