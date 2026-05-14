@@ -83,6 +83,7 @@ jobs:
                 run: clojure -T:build test-all
 
             -   name: Run debug TCK (stderr captured for artifact)
+                if: always()
                 run: clojure -T:build tck-debug-test 2>tck-debug.log || true
                 continue-on-error: true
 
