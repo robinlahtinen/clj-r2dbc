@@ -187,7 +187,7 @@
               :term (do (signal-terminator!)
                         (throw (Cancelled. "Row flow terminated.")))
               :err (do (signal-terminator!) (throw ^Throwable (nth action 1)))
-              :last (do (signal-terminator!) (nth action 1))
+              :last (do (notifier) (nth action 1))
               :last-err (do (notifier) (nth action 1))
               :more (do (notifier) (nth action 1))
               :wait (nth action 1)
@@ -305,7 +305,7 @@
               :term (do (signal-terminator!)
                         (throw (Cancelled. "Row chunk flow terminated.")))
               :err (do (signal-terminator!) (throw ^Throwable (nth action 1)))
-              :last (do (signal-terminator!) (nth action 1))
+              :last (do (notifier) (nth action 1))
               :last-err (do (notifier) (nth action 1))
               :req (let [v   (nth action 1)
                          sub (locking state
@@ -342,6 +342,10 @@
                :builder-fn - 2-arity (Row, RowMetadata) -> value; skips RowCursor entirely.
                :qualifier  - column keyword mode used when no :builder-fn is supplied.
                :fetch-size - rows per demand-driven batch (default 128).
+                             Clamped to 1 in flyweight mode (no :builder-fn):
+                             the R2DBC SPI permits drivers to recycle Row
+                             objects after onNext returns, so a flyweight
+                             buffer of size > 1 would expose stale rows.
                :returning  - calls Statement.returnGeneratedValues.
 
   Connection lifecycle:
@@ -358,9 +362,11 @@
     No eager collection - true end-to-end streaming from database to consumer.
 
   Zero-copy:
-    Row data is captured in onNext while Row is valid. Values stored in the
-    internal buffer are fully captured before the driver recycles the Row
-    object - safe to hold across deref boundaries."
+    With :builder-fn, row-xf materializes values inside result-row-pub's
+    BiFunction.apply() while the underlying ByteBuf is guaranteed live, so
+    buffered builder values are safe to hold across deref boundaries.
+    In flyweight mode (no :builder-fn), row-xf is identity and fetch-size
+    is clamped to 1 to prevent buffering stale Row references."
   [db sql params opts]
   (let [[db opts]  (conn/resolve-connectable db opts)
         chunk-size (:chunk-size opts)
@@ -387,7 +393,8 @@
                       (fn row-builder-xf [^Row row]
                         (builder-fn row (.getMetadata row)))
                       r2dbc-row-flow)
-          :else (let [crs (cursor/->RowCursor (ArrayDeque. 2) nil 0)]
+          :else (let [crs            (cursor/->RowCursor (ArrayDeque. 2) nil 0)
+                      flyweight-opts (assoc opts :fetch-size 1)]
                   (m/eduction
                    (map (fn cursor-step [^Row row]
                           (when (nil? (cursor/cursor-cache crs))
@@ -403,7 +410,7 @@
                    (lifecycle/streaming-plan-flow db
                                                   sql
                                                   params
-                                                  opts
+                                                  flyweight-opts
                                                   identity
                                                   r2dbc-row-flow))))))
 
