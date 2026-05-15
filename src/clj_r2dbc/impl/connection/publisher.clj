@@ -242,8 +242,11 @@
 (defn first-pub-blocking
   "Subscribe to pub, request one item, and return it synchronously.
 
-  Blocks the calling thread. Intended for driver-level one-shot publishers
-  (e.g., connection metadata) where Missionary scheduling is unavailable.
+  Blocks the calling thread. Production code paths prefer
+  conn/acquire-connection (a Missionary task that parks on m/blk rather
+  than the FJP, avoiding pool starvation under concurrent stream starts).
+  Kept here for the REPL examples and any future callers that already
+  hold a non-FJP thread.
 
   Args:
     pub     - Publisher<T> to subscribe to.
@@ -263,7 +266,11 @@
 (defn await-void-pub!
   "Subscribe to a Publisher<Void> and block until it completes.
 
-  Used for fire-and-forget publishers such as Statement.execute() void results.
+  Used for fire-and-forget publishers such as Statement.execute() void
+  results. Production code paths prefer util/void->task (returns a
+  Missionary task; awaited with m/? inside m/sp or m/ap, so the park
+  happens via the Missionary scheduler rather than the calling thread).
+  Kept here for REPL examples.
 
   Args:
     pub - Publisher<Void> to drain."
