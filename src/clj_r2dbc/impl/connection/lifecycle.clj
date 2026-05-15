@@ -14,151 +14,107 @@
 
   This namespace is an implementation detail; do not use from application code."
   (:require
-   [clj-r2dbc.debug-log :as dbg]
+   [clj-r2dbc.impl.connection :as conn]
    [clj-r2dbc.impl.connection.publisher :as pub]
-   [clj-r2dbc.impl.sql.statement :as stmt])
+   [clj-r2dbc.impl.sql.statement :as stmt]
+   [missionary.core :as m])
   (:import
-   (clojure.lang IDeref IFn)
-   (io.r2dbc.spi Connection ConnectionFactory Statement)
-   (java.util.concurrent CompletableFuture CountDownLatch)
-   (java.util.concurrent.atomic AtomicBoolean)
-   (missionary Cancelled)
-   (org.reactivestreams Publisher Subscription)))
+   (io.r2dbc.spi Connection Statement)
+   (org.reactivestreams Publisher Subscriber Subscription)))
 
 (set! *warn-on-reflection* true)
 
+(defn- close-conn-flow
+  "Wrap inner-flow so that when its terminator fires (normal completion, error,
+  or cancellation), Connection.close() is invoked once and the wrapper's
+  terminator fires when the close Publisher<Void> completes.
+
+  The wrapper passes through invoke (cancel) and deref to inner-flow unchanged;
+  only the terminator is intercepted. inner-flow's signal-terminator! uses an
+  AtomicBoolean to guarantee wrapped-term fires at most once."
+  [inner-flow ^Connection conn]
+  (fn [notifier terminator]
+    (let [wrapped-term
+          (fn []
+            (.subscribe ^Publisher (.close conn)
+                        (reify
+                          Subscriber
+                          (onSubscribe [_ s]
+                            (.request ^Subscription s Long/MAX_VALUE))
+                          (onNext [_ _])
+                          (onError [_ _] (terminator))
+                          (onComplete [_] (terminator)))))]
+      (inner-flow notifier wrapped-term))))
+
+(defn- fire-and-forget-close!
+  "Subscribe to Connection.close() and discard the result. Used on the error
+  path between connection acquisition and row-flow construction, when no flow
+  exists yet to own the close lifecycle."
+  [^Connection conn]
+  (try
+    (.subscribe ^Publisher (.close conn)
+                (reify
+                  Subscriber
+                  (onSubscribe [_ s]
+                    (.request ^Subscription s Long/MAX_VALUE))
+                  (onNext [_ _])
+                  (onError [_ _])
+                  (onComplete [_])))
+    (catch Throwable _ nil)))
+
 (defn streaming-plan-flow
-  "Return a Missionary flow emitting transformed rows with end-to-end
+  "Return a Missionary discrete flow emitting transformed rows with end-to-end
   demand-driven backpressure.
 
   Connection lifecycle: when db is a ConnectionFactory, the connection is
-  acquired at flow start and closed on completion/error/cancellation.
-  When db is already a Connection, the caller owns the lifecycle.
+  acquired at flow start (via conn/acquire-connection, which subscribes
+  non-blockingly and parks on the m/blk executor, not ForkJoinPool) and
+  closed on completion/error/cancellation. When db is already a Connection,
+  the caller owns the lifecycle.
+
+  Structure: an m/ap whose let-bindings (connection acquire, statement prep,
+  row-pub construction, inner row-flow construction) evaluate once before the
+  first m/?> emission; the inner row-flow is wrapped by close-conn-flow when
+  owned, so close runs exactly once via the inner flow's signal-terminator!
+  AtomicBoolean.
 
   row-flow-fn selects the per-row emission strategy:
     r2dbc-row-flow   - one row per deref() (default when not supplied).
     r2dbc-chunk-flow - one ArrayList per fetch-size batch per deref().
 
   Backpressure chain:
-    consumer m/reduce -> m/?> row-flow -> row-flow-fn.deref()
+    consumer m/reduce -> m/?> wrapped-flow -> row-flow.deref()
       -> Subscription.request(fetch-size) -> R2DBC driver -> database cursor
 
   Args:
-    db          - ConnectionFactory, Connection, or ConnectableWithOpts.
+    db          - ConnectionFactory or Connection (ConnectableWithOpts must be
+                  unwrapped by the caller via conn/resolve-connectable).
     sql         - SQL string to execute.
     params      - sequential collection of bind parameters.
     opts        - options map (see execute for supported keys).
     row-xf      - 1-arity fn applied to each raw R2DBC Row before buffering.
     row-flow-fn - fn [Publisher fetch-size xf] -> Missionary flow constructor."
-  ([db sql params opts row-xf row-flow-fn]
-   (let [fetch-size (pub/resolve-fetch-size opts)]
-     (fn [notifier terminator]
-       (let [state                                                    (Object.)
-             lc-id                                                    (str "LC" (Integer/toHexString (System/identityHashCode state)))
-             owns-conn?                                               (not (instance? Connection db))
-             conn-ref                                                 (volatile! nil)
-             conn-sub-ref                                             (volatile! nil)
-             result-sub-ref                                           (volatile! nil)
-             process-ref                                              (volatile! nil)
-             init-error-ref                                           (volatile! nil)
-             cancel-ref                                               (volatile! false)
-             ^AtomicBoolean term-ref                                  (AtomicBoolean. false)
-             init-latch                                               (CountDownLatch. 1)
-             signal-terminator!
-             (fn signal-terminator []
-               (let [won? (.compareAndSet term-ref false true)]
-                 (dbg/dlog lc-id " lifecycle signal-term won?=" won?)
-                 (when won? (terminator))))
-             close-owned-conn!                                        (fn close-owned-conn []
-                                                                        (when (and owns-conn? @conn-ref)
-                                                                          (pub/await-void-pub! (.close ^Connection
-                                                                                                @conn-ref))))
-             wrapped-terminator                                       (fn wrapped-terminator []
-                                                                        (dbg/dlog lc-id " wrapped-terminator owns?=" owns-conn?)
-                                                                        (close-owned-conn!)
-                                                                        (signal-terminator!))]
-         (dbg/dlog lc-id " INIT-ASYNC-START cancel?=" @cancel-ref)
-         (CompletableFuture/runAsync
-          (fn []
-            (try (let [^Connection c (if owns-conn?
-                                       (pub/first-pub-blocking
-                                        (.create ^ConnectionFactory db)
-                                        conn-sub-ref)
-                                       db)
-                       _             (vreset! conn-ref c)]
-                   (dbg/dlog lc-id " CONN-ACQUIRED owns?=" owns-conn?
-                             " cancel?=" @cancel-ref)
-                   (if @cancel-ref
-                     (do (dbg/dlog lc-id " CANCEL-PRE-PROCESS")
-                         (wrapped-terminator)
-                         (.countDown ^CountDownLatch init-latch))
-                     (let [^Statement s                                          (stmt/prepare! c sql params opts)
-                           row-pub                                               (pub/result-rows-pub (.execute s)
-                                                                                                      result-sub-ref
-                                                                                                      row-xf)
-                           process
-                           ((row-flow-fn ^Publisher row-pub fetch-size identity)
-                            notifier
-                            wrapped-terminator)]
-                       (vreset! process-ref process)
-                       (dbg/dlog lc-id " PROCESS-STORED process="
-                                 (Integer/toHexString (System/identityHashCode process)))
-                       (.countDown ^CountDownLatch init-latch)
-                       (when @cancel-ref
-                         (dbg/dlog lc-id " CANCEL-POST-LATCH invoking process")
-                         (.invoke ^IFn process)))))
-                 (catch Throwable t
-                   (dbg/dlog lc-id " INIT-ERROR " (.getMessage t))
-                   (vreset! init-error-ref t)
-                   (try (close-owned-conn!) (catch Throwable _))
-                   (.countDown ^CountDownLatch init-latch)
-                   (notifier)))))
-         (reify
-           IFn
-           (invoke [_]
-             (dbg/dlog lc-id " lifecycle invoke/cancel ENTER"
-                       " process?=" (some? @process-ref)
-                       " term?=" (.get term-ref))
-             (let [[process conn-sub result-sub] (locking state
-                                                   (vreset! cancel-ref true)
-                                                   [@process-ref @conn-sub-ref
-                                                    @result-sub-ref])]
-               (dbg/dlog lc-id " lifecycle invoke/cancel LOCKED"
-                         " process?=" (some? process)
-                         " conn-sub?=" (some? conn-sub))
-               (when conn-sub (.cancel ^Subscription conn-sub))
-               (when result-sub (.cancel ^Subscription result-sub))
-               (if process
-                 (.invoke ^IFn process)
-                 (do (try (close-owned-conn!) (catch Throwable _))
-                     (signal-terminator!))))
-             nil)
-           IDeref
-           (deref [_]
-             (dbg/dlog lc-id " lifecycle deref"
-                       " init-err?=" (some? @init-error-ref)
-                       " process?=" (some? @process-ref)
-                       " cancel?=" @cancel-ref)
-             (cond
-               @init-error-ref (throw ^Throwable @init-error-ref)
-               @process-ref (.deref ^IDeref @process-ref)
-               @cancel-ref (throw (Cancelled.
-                                   "Streaming plan flow cancelled."))
-               :else
-               (do
-                 (.await ^CountDownLatch init-latch)
-                 (cond
-                   @init-error-ref (throw ^Throwable @init-error-ref)
-                   @cancel-ref (throw (Cancelled.
-                                       "Streaming plan flow cancelled."))
-                   @process-ref (.deref ^IDeref @process-ref)
-                   :else
-                   (throw
-                    (IllegalStateException.
-                     "streaming-plan-flow: latch released with no terminal state (invariant violated)"))))))))))))
+  [db sql params opts row-xf row-flow-fn]
+  (let [fetch-size (pub/resolve-fetch-size opts)
+        owns-conn? (not (instance? Connection db))]
+    (m/ap
+     (let [^Connection conn                                                                        (m/? (conn/acquire-connection db))
+           wrapped
+           (try
+             (let [^Statement stmt                      (stmt/prepare! conn sql params opts)
+                   ^Publisher row-pub
+                   (pub/result-rows-pub (.execute stmt)
+                                        (volatile! nil)
+                                        row-xf)
+                   inner                                (row-flow-fn row-pub fetch-size identity)]
+               (if owns-conn? (close-conn-flow inner conn) inner))
+             (catch Throwable t
+               (when owns-conn? (fire-and-forget-close! conn))
+               (throw t)))]
+       (m/?> wrapped)))))
 
 (comment
-  (require '[clj-r2dbc :as r2] '[missionary.core :as m])
+  (require '[clj-r2dbc :as r2])
   (def db (r2/connect "r2dbc:h2:mem:///lifecycle-repl;DB_CLOSE_DELAY=-1"))
   (m/? (m/reduce conj [] (r2/stream db "SELECT 1 AS n")))
   (m/? (r2/with-conn [conn db]
