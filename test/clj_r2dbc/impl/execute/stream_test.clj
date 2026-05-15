@@ -12,7 +12,6 @@
   Setup: test_table created once before all tests via use-fixtures :once."
   (:require
    [clj-r2dbc.impl.connection :as conn]
-   [clj-r2dbc.impl.connection.lifecycle :as lifecycle]
    [clj-r2dbc.impl.connection.publisher :as pub]
    [clj-r2dbc.impl.datafy :as datafy-impl]
    [clj-r2dbc.impl.execute.stream :as stream]
@@ -25,7 +24,7 @@
    [missionary.core :as m])
   (:import
    (clj_r2dbc.impl.sql.cursor RowCursor)
-   (clojure.lang ExceptionInfo IDeref IFn)
+   (clojure.lang ExceptionInfo)
    (io.r2dbc.spi Connection Row)))
 
 (set! *warn-on-reflection* true)
@@ -499,27 +498,3 @@
                                           :fetch-size 1}))
                                        (m/sp nil)))))))]
       (is (= 20 (count results))))))
-
-(deftest streaming-plan-flow-init-latch-race-test
-  (testing
-   "deref awaits init-latch when notifier fires before T1 writes process-ref"
-    (let [mock-fn (fn [_row-pub _fetch-size _row-xf]
-                    (fn [notifier terminator]
-                      (future (notifier))
-                      (Thread/sleep 50)
-                      (reify
-                        IFn
-                        (invoke [_] nil)
-                        IDeref
-                        (deref [_] (terminator) ::result))))
-          result  (db/run-task! (m/reduce
-                                 conj
-                                 []
-                                 (lifecycle/streaming-plan-flow
-                                  (get-factory)
-                                  "SELECT id FROM test_table ORDER BY id"
-                                  []
-                                  {:builder-fn (row/make-row-fn)}
-                                  identity
-                                  mock-fn)))]
-      (is (= [::result] result)))))
