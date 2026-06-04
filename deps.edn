@@ -60,10 +60,10 @@
                          "-server" "-Xms1g" "-Xmx1g"]
            :exec-fn     clj-r2dbc.bench.runner/run}
   :build  {:deps       {io.github.clojure/tools.build
-                        {:mvn/version "0.10.13"}
-                        slipset/deps-deploy {:mvn/version "0.2.3"}}
+                        {:mvn/version "0.10.14"}
+                        slipset/deps-deploy {:mvn/version "0.2.5"}}
            :ns-default build}
-  :lint   {:replace-deps {clj-kondo/clj-kondo {:mvn/version "2026.04.15"}}
+  :lint   {:replace-deps {clj-kondo/clj-kondo {:mvn/version "2026.05.25"}}
            :main-opts    ["-m" "clj-kondo.main" "--lint" "src" "test" "bench" "build.clj"]}
   :format {:deps       {dev.weavejester/cljfmt {:mvn/version "0.16.4"}}
            :ns-default cljfmt.tool
