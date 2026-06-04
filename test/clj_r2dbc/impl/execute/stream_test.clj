@@ -437,8 +437,9 @@
 
 (deftest streaming-plan-flow-concurrent-stress-test
   (testing
-   "no ISE from process-ref/notifier race under concurrent warm-pool load"
-    (let [results (db/run-task!
+   "no hang or ISE under concurrent warm-pool load"
+    (let [results (db/run-task-timeout!
+                   30000
                    (m/reduce conj
                              []
                              (m/ap (let [_i (m/?> 20 (m/seed (range 100)))]
@@ -458,7 +459,8 @@
 (deftest streaming-plan-flow-concurrent-init-error-test
   (testing
    "no hang and correct error type when T1 throws under concurrent warm-pool load"
-    (let [results (db/run-task!
+    (let [results (db/run-task-timeout!
+                   30000
                    (m/reduce
                     conj
                     []
@@ -481,7 +483,8 @@
 (deftest streaming-plan-flow-concurrent-cancel-test
   (testing
    "no hang when stream is cancelled before first row under concurrent warm-pool load"
-    (let [results (db/run-task!
+    (let [results (db/run-task-timeout!
+                   30000
                    (m/reduce conj
                              []
                              (m/ap (let [_i (m/?> 20 (m/seed (range 20)))]

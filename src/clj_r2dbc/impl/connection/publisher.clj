@@ -21,13 +21,14 @@
     first-pub-blocking - blocking first-value extraction from a Publisher.
     await-void-pub!    - blocking drain-and-discard for void Publishers.
     await-future       - blocking CompletableFuture unwrap.
-    request-async!     - async Subscription.request call via ForkJoinPool.
+    request-async!     - async Subscription.request call via m/blk.
     resolve-fetch-size - safe fetch-size extraction from opts.
     add-demand         - saturating addition for demand accounting.
 
   This namespace is an implementation detail; do not use from application code."
   (:require
-   [clj-r2dbc.debug-log :as dbg])
+   [clj-r2dbc.debug-log :as dbg]
+   [missionary.core :as m])
   (:import
    (io.r2dbc.spi Result)
    (java.util.concurrent CompletableFuture ExecutionException)
@@ -289,14 +290,14 @@
 (defn request-async!
   "Call Subscription.request(n) on sub asynchronously.
 
-  Schedules the request on a ForkJoinPool background thread to avoid
-  re-entrant driver callbacks.
+  Schedules the request on the Missionary blocking executor (m/blk) to avoid
+  re-entrant driver callbacks and prevent ForkJoinPool starvation.
 
   Args:
     sub - Subscription to request from.
     n   - number of items to request."
   [^Subscription sub ^long n]
-  (CompletableFuture/runAsync (fn [] (.request sub n))))
+  (CompletableFuture/runAsync (fn [] (.request sub n)) m/blk))
 
 (comment
   (resolve-fetch-size {})

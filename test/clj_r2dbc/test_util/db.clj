@@ -5,9 +5,10 @@
   "Shared helpers for integration tests.
 
   Provides:
-    run-task!        - parks a Missionary task on the calling thread, returns result
-    insert-fixtures! - inserts common test data
-    drop-fixtures!   - drops test tables"
+    run-task!           - parks a Missionary task on the calling thread, returns result
+    run-task-timeout!   - like run-task!, but with timeout and thread dump on expiry
+    insert-fixtures!    - inserts common test data
+    drop-fixtures!      - drops test tables"
   (:require
    [missionary.core :as m])
   (:import
@@ -26,6 +27,30 @@
   (run-task! (m/sp (throw (ex-info \"boom\" {}))))  ;=> throws"
   [task]
   (m/? task))
+
+(defn run-task-timeout!
+  "Like run-task!, but fails after timeout-ms with a full JVM thread dump.
+
+  Converts silent CI kills into fast diagnostic failures by capturing all thread
+  stacks when the task does not complete within the timeout.
+
+  Args:
+    timeout-ms - deadline in milliseconds before dumping stacks and throwing
+    task       - Missionary task to run
+
+  Returns the task result on success. Throws ExceptionInfo with thread dump on timeout."
+  [timeout-ms task]
+  (let [f   (future (run-task! task))
+        res (deref f timeout-ms ::timeout)]
+    (if (= res ::timeout)
+      (do
+        (future-cancel f)
+        (println "\n=== TIMEOUT after" timeout-ms "ms — JVM thread dump ===")
+        (doseq [[^Thread t stack] (Thread/getAllStackTraces)]
+          (println (str "\nThread: " (.getName t) " state=" (.getState t)))
+          (run! #(println "  " %) stack))
+        (throw (ex-info "concurrent test timed out" {:timeout-ms timeout-ms})))
+      res)))
 
 (defn- subscribe-consume
   "Subscribe to an R2DBC Publisher and consume all values, returning nil

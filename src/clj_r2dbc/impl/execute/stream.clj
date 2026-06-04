@@ -60,7 +60,7 @@
   "Return a Missionary discrete flow that bridges an R2DBC Publisher<Row>
   into demand-driven row emission with fetch-size batching.
 
-  Subscribes asynchronously (via ForkJoinPool.commonPool) to prevent
+  Subscribes asynchronously (via m/blk, Missionary blocking executor) to prevent
   notifier from being called during the flow constructor. This is required
   because Ambiguous.suspend assigns c.iterator = flow.invoke(...) only after
   flow.invoke returns. Synchronous publishers (e.g., Reactor FluxFlatMap with
@@ -144,7 +144,8 @@
                           " cancel?=" @cancel-ref)
                 (if empty? (signal-terminator!) (notifier)))))]
       (CompletableFuture/runAsync (fn []
-                                    (.subscribe ^Publisher row-pub subscriber)))
+                                    (.subscribe ^Publisher row-pub subscriber))
+                                  m/blk)
       (reify
         IFn
         (invoke [_]
@@ -222,6 +223,9 @@
   row-xf is applied in onNext before buffering; values in the chunk are
   fully captured while Row is valid - safe to retain across deref boundaries.
 
+  Subscribes asynchronously (via m/blk, Missionary blocking executor) to prevent
+  reentrancy with synchronous publishers (see r2dbc-row-flow docstring).
+
   The :more branch from r2dbc-row-flow is eliminated: since the entire buffer
   is drained per deref(), the buffer is always empty after each transfer."
   [^Publisher row-pub ^long fetch-size row-xf]
@@ -274,7 +278,8 @@
                     (locking state (vreset! done-ref true) (.isEmpty buf))]
                 (if empty? (signal-terminator!) (notifier)))))]
       (CompletableFuture/runAsync (fn []
-                                    (.subscribe ^Publisher row-pub subscriber)))
+                                    (.subscribe ^Publisher row-pub subscriber))
+                                  m/blk)
       (reify
         IFn
         (invoke [_]
