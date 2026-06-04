@@ -27,7 +27,6 @@
 
   This namespace is an implementation detail; do not use from application code."
   (:require
-   [clj-r2dbc.debug-log :as dbg]
    [missionary.core :as m])
   (:import
    (io.r2dbc.spi Result)
@@ -121,7 +120,6 @@
     Publisher
     (subscribe [_ downstream]
       (let [state                                                             (Object.)
-            pub-id                                                            (str "PUB" (Integer/toHexString (System/identityHashCode state)))
             requested-ref                                                     (volatile! (long 0))
             inner-sub-ref                                                     (volatile! nil)
             outer-done-ref                                                    (volatile! false)
@@ -131,11 +129,9 @@
             ^AtomicBoolean terminal-ref                                       (AtomicBoolean. false)
             complete!                                                         (fn []
                                                                                 (let [won? (.compareAndSet terminal-ref false true)]
-                                                                                  (dbg/dlog pub-id " complete! won?=" won?)
                                                                                   (when won? (.onComplete downstream))))
             fail!                                                             (fn [t]
                                                                                 (let [won? (.compareAndSet terminal-ref false true)]
-                                                                                  (dbg/dlog pub-id " fail! won?=" won? " type=" (.getSimpleName (class t)))
                                                                                   (when won? (.onError downstream t))))
             request-next-result!
             (fn []
@@ -204,7 +200,6 @@
                        should-complete? (complete!)
                        :else (request-next-result!)))))
            (cancel [_]
-             (dbg/dlog pub-id " downstream cancel already?=" @cancelled-ref)
              (let [[^Subscription outer-sub ^Subscription inner-sub]
                    (locking state
                      (when-not @cancelled-ref (vreset! cancelled-ref true))

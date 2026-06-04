@@ -4,7 +4,6 @@
 (ns clj-r2dbc.tck.streaming-contract-test
   (:require
    [clj-r2dbc :as r2dbc]
-   [clj-r2dbc.debug-log :as dbg]
    [clj-r2dbc.impl.sql.cursor :as cursor]
    [clj-r2dbc.impl.sql.row :as row]
    [clj-r2dbc.integration.fixtures :as fx]
@@ -224,17 +223,12 @@
                   80
                   (prop/for-all
                    [stop-at (gen/choose 1 500) fetch-sz (gen/choose 1 128)]
-                   (let [iter-id  (str "ITER" (System/nanoTime))
-                         _        (dbg/dlog iter-id " START stop-at=" stop-at " fetch-sz=" fetch-sz)
-                         consumed (db/run-task!
+                   (let [consumed (db/run-task!
                                    (m/reduce
                                     (fn [acc _]
                                       (let [n (inc acc)]
-                                        (when (>= n (- stop-at 3))
-                                          (dbg/dlog iter-id " near-reduce n=" n " stop-at=" stop-at))
                                         (if (= stop-at n)
-                                          (do (dbg/dlog iter-id " REDUCED n=" n)
-                                              (reduced n))
+                                          (reduced n)
                                           n)))
                                     0
                                     (r2dbc/stream
@@ -244,11 +238,7 @@
                                       :builder    (row/make-row-fn)
                                       :fetch-size fetch-sz})))
                          passed?  (= stop-at consumed)]
-                     (dbg/dlog iter-id " END consumed=" consumed " expected=" stop-at " passed?=" passed?)
                      passed?)))]
-      (dbg/dlog "QCHECK END num-tests=" (:num-tests result)
-                " result=" (:result result)
-                " shrunk=" (pr-str (:shrunk result)))
       (is (:result result)
           (str "Property failed after " (:num-tests result)
                " tests. Shrunk: " (pr-str (:shrunk result)))))))
