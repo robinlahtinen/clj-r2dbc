@@ -14,6 +14,7 @@
 
   This namespace is an implementation detail; do not use from application code."
   (:require
+   [clj-r2dbc.debug-log :as dbg]
    [clj-r2dbc.impl.connection :as conn]
    [clj-r2dbc.impl.connection.publisher :as pub]
    [clj-r2dbc.impl.sql.statement :as stmt]
@@ -34,16 +35,23 @@
   AtomicBoolean to guarantee wrapped-term fires at most once."
   [inner-flow ^Connection conn]
   (fn [notifier terminator]
-    (let [wrapped-term
+    (let [conn-id                                                                  (str "CC" (Integer/toHexString (System/identityHashCode conn)))
+          wrapped-term
           (fn []
+            (dbg/dlog conn-id " wrapped-term ENTER -> subscribe (.close conn)")
             (.subscribe ^Publisher (.close conn)
                         (reify
                           Subscriber
                           (onSubscribe [_ s]
                             (.request ^Subscription s Long/MAX_VALUE))
                           (onNext [_ _])
-                          (onError [_ _] (terminator))
-                          (onComplete [_] (terminator)))))]
+                          (onError [_ t]
+                            (dbg/dlog conn-id " close onError -> terminator type="
+                                      (.getSimpleName (class t)))
+                            (terminator))
+                          (onComplete [_]
+                            (dbg/dlog conn-id " close onComplete -> terminator")
+                            (terminator)))))]
       (inner-flow notifier wrapped-term))))
 
 (defn- fire-and-forget-close!
@@ -99,6 +107,9 @@
         owns-conn? (not (instance? Connection db))]
     (m/ap
      (let [^Connection conn                                                                        (m/? (conn/acquire-connection db))
+           _                                                                                       (dbg/dlog "SPF conn acquired id="
+                                                                                                             (Integer/toHexString (System/identityHashCode conn))
+                                                                                                             " owns-conn?=" owns-conn?)
            wrapped
            (try
              (let [^Statement stmt                      (stmt/prepare! conn sql params opts)
@@ -109,8 +120,10 @@
                    inner                                (row-flow-fn row-pub fetch-size identity)]
                (if owns-conn? (close-conn-flow inner conn) inner))
              (catch Throwable t
+               (dbg/dlog "SPF init error type=" (.getSimpleName (class t)))
                (when owns-conn? (fire-and-forget-close! conn))
                (throw t)))]
+       (dbg/dlog "SPF entering m/?> wrapped flow")
        (m/?> wrapped)))))
 
 (comment

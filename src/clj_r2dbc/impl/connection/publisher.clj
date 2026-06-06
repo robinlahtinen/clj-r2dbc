@@ -27,6 +27,7 @@
 
   This namespace is an implementation detail; do not use from application code."
   (:require
+   [clj-r2dbc.debug-log :as dbg]
    [missionary.core :as m])
   (:import
    (io.r2dbc.spi Result)
@@ -120,6 +121,7 @@
     Publisher
     (subscribe [_ downstream]
       (let [state                                                             (Object.)
+            pub-id                                                            (str "PUB" (Integer/toHexString (System/identityHashCode state)))
             requested-ref                                                     (volatile! (long 0))
             inner-sub-ref                                                     (volatile! nil)
             outer-done-ref                                                    (volatile! false)
@@ -129,13 +131,15 @@
             ^AtomicBoolean terminal-ref                                       (AtomicBoolean. false)
             complete!                                                         (fn []
                                                                                 (let [won? (.compareAndSet terminal-ref false true)]
+                                                                                  (dbg/dlog pub-id " complete! won?=" won?)
                                                                                   (when won? (.onComplete downstream))))
             fail!                                                             (fn [t]
                                                                                 (let [won? (.compareAndSet terminal-ref false true)]
+                                                                                  (dbg/dlog pub-id " fail! won?=" won? " type=" (.getSimpleName (class t)))
                                                                                   (when won? (.onError downstream t))))
             request-next-result!
             (fn []
-              (let [^Subscription outer-sub
+              (let [[^Subscription outer-sub reason]
                     (locking state
                       (let [ok (and (not @cancelled-ref)
                                     (not @outer-done-ref)
@@ -144,9 +148,19 @@
                                     (nil? @inner-sub-ref)
                                     (pos? ^long @requested-ref)
                                     @result-sub-ref)]
-                        (when ok
-                          (vreset! outer-pending-ref true)
-                          @result-sub-ref)))]
+                        (if ok
+                          (do (vreset! outer-pending-ref true)
+                              [@result-sub-ref nil])
+                          [nil (cond @cancelled-ref               :cancelled
+                                     @outer-done-ref              :outer-done
+                                     @outer-pending-ref           :outer-pending
+                                     @inner-live-ref              :inner-live
+                                     (some? @inner-sub-ref)       :inner-sub
+                                     (not (pos? ^long @requested-ref)) :no-demand
+                                     (nil? @result-sub-ref)       :no-outer-sub
+                                     :else                        :unknown)])))]
+                (dbg/dlog pub-id " req-next-result "
+                          (if outer-sub "TAKE outer.request(1)" (str "SKIP:" reason)))
                 (when outer-sub (.request outer-sub 1))))
             row-subscriber
             (reify
@@ -158,6 +172,8 @@
                                               (do (vreset! inner-sub-ref s)
                                                   [false
                                                    ^long @requested-ref])))]
+                  (dbg/dlog pub-id " inner.onSubscribe cancel?=" cancel?
+                            " forward-requested=" requested)
                   (if cancel?
                     (.cancel ^Subscription s)
                     (when (pos? ^long requested)
@@ -178,6 +194,7 @@
                                       (vreset! inner-live-ref false)
                                       (and @outer-done-ref
                                            (not @cancelled-ref)))]
+                  (dbg/dlog pub-id " inner.onComplete complete-now?=" complete-now?)
                   (if complete-now? (complete!) (request-next-result!)))))]
         (.onSubscribe
          downstream
@@ -196,10 +213,15 @@
                               (and @outer-done-ref
                                    (not @inner-live-ref)
                                    (nil? @inner-sub-ref))])))]
+                 (dbg/dlog pub-id " downstream.request n=" n
+                           " branch=" (cond inner-sub :inner
+                                            should-complete? :complete
+                                            :else :next-result))
                  (cond inner-sub (.request inner-sub (long n))
                        should-complete? (complete!)
                        :else (request-next-result!)))))
            (cancel [_]
+             (dbg/dlog pub-id " downstream.cancel already?=" @cancelled-ref)
              (let [[^Subscription outer-sub ^Subscription inner-sub]
                    (locking state
                      (when-not @cancelled-ref (vreset! cancelled-ref true))
@@ -220,6 +242,7 @@
                              (if @cancelled-ref
                                true
                                (do (vreset! inner-live-ref true) false)))]
+               (dbg/dlog pub-id " outer.onNext result cancel?=" cancel?)
                (when-not cancel?
                  (.subscribe ^Publisher (result-row-pub ^Result result row-xf)
                              ^Subscriber row-subscriber))))
@@ -233,6 +256,7 @@
                                    (and (not @inner-live-ref)
                                         (nil? @inner-sub-ref)
                                         (not @cancelled-ref)))]
+               (dbg/dlog pub-id " outer.onComplete complete-now?=" complete-now?)
                (when complete-now? (complete!))))))))))
 
 (defn first-pub-blocking

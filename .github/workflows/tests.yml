@@ -51,6 +51,10 @@ jobs:
         env:
             CLJ_R2DBC_TEST_PG_URL: r2dbc:postgresql://clj_r2dbc:clj_r2dbc@localhost:5432/clj_r2dbc
             CLJ_R2DBC_TEST_MARIADB_URL: r2dbc:mariadb://clj_r2dbc:clj_r2dbc@localhost:3306/clj_r2dbc
+            # DIAGNOSTIC: activate streaming-flow concurrency trace in the unit-test
+            # JVM to localize the lost-wakeup (see plan C/D). Remove once the dropped
+            # notifier/terminator is identified and fixed.
+            CLJ_R2DBC_TRACE: "1"
 
         steps:
             -   name: Checkout

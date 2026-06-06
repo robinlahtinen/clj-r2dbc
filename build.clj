@@ -50,10 +50,19 @@
   opts)
 
 (defn test
-  "Run unit and property tests. Excludes integration and TCK scopes."
+  "Run unit and property tests. Excludes integration and TCK scopes.
+
+  The unit-test JVM is spawned via b/java-command + b/process, which bypasses
+  the `clojure` bash wrapper and therefore does NOT inherit JVM_OPTS (see
+  open-issues doc 9.1). Concurrency-trace logging is forwarded explicitly via
+  :java-opts when the CLJ_R2DBC_TRACE env var is set, so a diagnostic CI run can
+  emit the streaming-flow trace log without touching production defaults."
   [opts]
   (let [basis          (b/create-basis {:aliases [:test]})
+        trace?         (some? (System/getenv "CLJ_R2DBC_TRACE"))
         cmds           (b/java-command {:basis     basis
+                                        :java-opts (cond-> []
+                                                     trace? (conj "-Dclj-r2dbc.trace=true"))
                                         :main      'clojure.main
                                         :main-args ["-m" "cognitect.test-runner" "-e"
                                                     ":integration" "-e" ":tck"]})

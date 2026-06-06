@@ -54,6 +54,12 @@
 
 (def ^:private select-none "SELECT id, name FROM test_table WHERE id = -999")
 
+(def ^:private concurrent-iterations
+  "Fixed iteration count for the concurrent stress/guard tests. The lost-wakeup
+  race is low-probability per run, so each test loops to raise the chance of
+  surfacing it within a single CI run (see plan: regression guard B)."
+  50)
+
 (deftest plan-empty-result-test
   (testing "plan* on empty result set completes with zero emissions"
     (let [cf     (get-factory)
@@ -438,66 +444,70 @@
 (deftest streaming-plan-flow-concurrent-stress-test
   (testing
    "no hang or ISE under concurrent warm-pool load"
-    (let [results (db/run-task-timeout!
-                   30000
-                   (m/reduce conj
-                             []
-                             (m/ap (let [_i (m/?> 20 (m/seed (range 100)))]
-                                     (m/?
-                                      (m/reduce
-                                       (fn [acc _] (inc acc))
-                                       0
-                                       (stream/stream*
-                                        (get-factory)
-                                        "SELECT id FROM test_table ORDER BY id"
-                                        []
-                                        {:builder-fn (row/make-row-fn)
-                                         :fetch-size 1})))))))]
-      (is (= 100 (count results)))
-      (is (every? #(= 3 %) results)))))
+    (dotimes [iter concurrent-iterations]
+      (let [results (db/run-task-timeout!
+                     30000
+                     (m/reduce conj
+                               []
+                               (m/ap (let [_i (m/?> 20 (m/seed (range 100)))]
+                                       (m/?
+                                        (m/reduce
+                                         (fn [acc _] (inc acc))
+                                         0
+                                         (stream/stream*
+                                          (get-factory)
+                                          "SELECT id FROM test_table ORDER BY id"
+                                          []
+                                          {:builder-fn (row/make-row-fn)
+                                           :fetch-size 1})))))))]
+        (is (= 100 (count results)) (str "iteration " iter))
+        (is (every? #(= 3 %) results) (str "iteration " iter))))))
 
 (deftest streaming-plan-flow-concurrent-init-error-test
   (testing
    "no hang and correct error type when T1 throws under concurrent warm-pool load"
-    (let [results (db/run-task-timeout!
-                   30000
-                   (m/reduce
-                    conj
-                    []
-                    (m/ap (let [_i (m/?> 20 (m/seed (range 20)))]
-                            (try (m/? (m/reduce
-                                       conj
-                                       []
-                                       (stream/stream*
-                                        (get-factory)
-                                        "SELECT * FROM nonexistent_table_xyz"
-                                        []
-                                        {:builder-fn (row/make-row-fn)
-                                         :fetch-size 1})))
-                                 (catch Throwable e e))))))]
-      (is (= 20 (count results)))
-      (is (every? #(and (instance? Throwable %)
-                        (not (instance? IllegalStateException %)))
-                  results)))))
+    (dotimes [iter concurrent-iterations]
+      (let [results (db/run-task-timeout!
+                     30000
+                     (m/reduce
+                      conj
+                      []
+                      (m/ap (let [_i (m/?> 20 (m/seed (range 20)))]
+                              (try (m/? (m/reduce
+                                         conj
+                                         []
+                                         (stream/stream*
+                                          (get-factory)
+                                          "SELECT * FROM nonexistent_table_xyz"
+                                          []
+                                          {:builder-fn (row/make-row-fn)
+                                           :fetch-size 1})))
+                                   (catch Throwable e e))))))]
+        (is (= 20 (count results)) (str "iteration " iter))
+        (is (every? #(and (instance? Throwable %)
+                          (not (instance? IllegalStateException %)))
+                    results)
+            (str "iteration " iter))))))
 
 (deftest streaming-plan-flow-concurrent-cancel-test
   (testing
    "no hang when stream is cancelled before first row under concurrent warm-pool load"
-    (let [results (db/run-task-timeout!
-                   30000
-                   (m/reduce conj
-                             []
-                             (m/ap (let [_i (m/?> 20 (m/seed (range 20)))]
-                                     (m/?
-                                      (m/race
-                                       (m/reduce
-                                        conj
-                                        []
-                                        (stream/stream*
-                                         (get-factory)
-                                         "SELECT id FROM test_table ORDER BY id"
-                                         []
-                                         {:builder-fn (row/make-row-fn)
-                                          :fetch-size 1}))
-                                       (m/sp nil)))))))]
-      (is (= 20 (count results))))))
+    (dotimes [iter concurrent-iterations]
+      (let [results (db/run-task-timeout!
+                     30000
+                     (m/reduce conj
+                               []
+                               (m/ap (let [_i (m/?> 20 (m/seed (range 20)))]
+                                       (m/?
+                                        (m/race
+                                         (m/reduce
+                                          conj
+                                          []
+                                          (stream/stream*
+                                           (get-factory)
+                                           "SELECT id FROM test_table ORDER BY id"
+                                           []
+                                           {:builder-fn (row/make-row-fn)
+                                            :fetch-size 1}))
+                                         (m/sp nil)))))))]
+        (is (= 20 (count results)) (str "iteration " iter))))))
