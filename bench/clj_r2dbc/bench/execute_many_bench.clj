@@ -54,7 +54,7 @@
   (println "  execute-many-100 ...")
   (bench/bench (execute-many-count 100)
                :viewer :none
-               :collect-plan {:scheme-type :one-shot})
+               :collect-plan :one-shot)
   (bench-util/extract-result))
 
 (defn execute-many-1000-bench
@@ -63,7 +63,7 @@
   (println "  execute-many-1000 ...")
   (bench/bench (execute-many-count 1000)
                :viewer :none
-               :collect-plan {:scheme-type :one-shot})
+               :collect-plan :one-shot)
   (bench-util/extract-result))
 
 (defn run-all

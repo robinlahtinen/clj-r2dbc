@@ -1,139 +1,124 @@
-{:generated-at "2026-03-23T13:34:10.515134700Z",
+{:generated-at "2026-06-06T13:28:40.541999700Z",
  :results
  {"bind-params"
   {:mono-type
-   {:mean-ns 415.74539363484087,
-    :variance-ns 962582.4254421797,
-    :batch-size 33,
+   {:mean-ns 432.2444041137326,
+    :variance-ns 311689.548414647,
+    :batch-size 29,
     :num-samples 200},
    :poly-type
-   {:mean-ns 504.25757575757575,
-    :variance-ns 1142707.7737170688,
+   {:mean-ns 441.92696192696195,
+    :variance-ns 313506.3241454991,
     :batch-size 33,
     :num-samples 200}},
   "execute-many"
   {:execute-many-100
-   {:mean-ns 47493800,
+   {:mean-ns 3.98112E7,
     :variance-ns 0.0,
     :batch-size 1,
     :num-samples 1},
    :execute-many-1000
-   {:mean-ns 92447200,
+   {:mean-ns 8.52247E7,
     :variance-ns 0.0,
     :batch-size 1,
     :num-samples 1}},
   "metadata-cache"
   {:cold-start
-   {:mean-ns 132.56565656565655,
-    :variance-ns 213874.11577706013,
-    :batch-size 125,
+   {:mean-ns 108.38153443195459,
+    :variance-ns 71511.99873888942,
+    :batch-size 119,
     :num-samples 200},
    :hot-path
-   {:mean-ns 188.37209302325581,
-    :variance-ns 323451.7766497459,
+   {:mean-ns 154.25356339084772,
+    :variance-ns 96090.96754708147,
     :batch-size 86,
     :num-samples 200}},
   "pipeline-fusion"
   {:unfused-4
-   {:mean-ns 5573.1623931623935,
-    :variance-ns 1.0620078949687203E7,
-    :batch-size 3,
+   {:mean-ns 5006.153846153846,
+    :variance-ns 5330284.694686762,
+    :batch-size 2,
     :num-samples 200},
    :fused-4
-   {:mean-ns 4090.0552486187844,
-    :variance-ns 67634.43830570913,
+   {:mean-ns 5085.929648241206,
+    :variance-ns 1.2567834373889653E7,
     :batch-size 2,
     :num-samples 200},
    :unfused-16
-   {:mean-ns 15906.091370558375,
-    :variance-ns 3.989312597120068E7,
+   {:mean-ns 13118.918918918918,
+    :variance-ns 465489.97977569303,
     :batch-size 1,
     :num-samples 200},
    :fused-16
-   {:mean-ns 13497.959183673469,
-    :variance-ns 1.938666248037682E7,
+   {:mean-ns 12265.193370165745,
+    :variance-ns 2.1541837323511373E7,
     :batch-size 1,
     :num-samples 200}},
   "plan-streaming"
-  {:synthetic-fetch-size-1
-   {:mean-ns 225060900,
-    :variance-ns 0.0,
-    :batch-size 1,
-    :num-samples 1},
-   :synthetic-fetch-size-32
-   {:mean-ns 37833500,
-    :variance-ns 0.0,
-    :batch-size 1,
-    :num-samples 1},
-   :synthetic-fetch-size-256
-   {:mean-ns 37495000,
-    :variance-ns 0.0,
-    :batch-size 1,
-    :num-samples 1},
-   :synthetic-chunk-fetch-size-1
-   {:mean-ns 45933200,
-    :variance-ns 0.0,
-    :batch-size 1,
-    :num-samples 1},
-   :synthetic-chunk-fetch-size-32
-   {:mean-ns 6697500, :variance-ns 0.0, :batch-size 1, :num-samples 1},
-   :h2-fetch-size-1
-   {:mean-ns 109109000,
+  {:h2-fetch-size-1
+   {:mean-ns 7.52943E7,
     :variance-ns 0.0,
     :batch-size 1,
     :num-samples 1},
    :h2-fetch-size-32
-   {:mean-ns 26050300,
+   {:mean-ns 2.40171E7,
     :variance-ns 0.0,
     :batch-size 1,
     :num-samples 1},
    :h2-fetch-size-256
-   {:mean-ns 16406400,
+   {:mean-ns 1.96963E7,
+    :variance-ns 0.0,
+    :batch-size 1,
+    :num-samples 1},
+   :h2-chunk-fetch-size-1
+   {:mean-ns 4.50898E7,
+    :variance-ns 0.0,
+    :batch-size 1,
+    :num-samples 1},
+   :h2-chunk-fetch-size-32
+   {:mean-ns 1.33874E7,
     :variance-ns 0.0,
     :batch-size 1,
     :num-samples 1}},
   "row-to-map"
   {:hundred-rows
-   {:mean-ns 11168.586387434554,
-    :variance-ns 1.260142904381369E7,
+   {:mean-ns 10135.5,
+    :variance-ns 1.2008833919597996E7,
     :batch-size 1,
     :num-samples 200},
    :single-row
-   {:mean-ns 103.75063724419198,
-    :variance-ns 240808.38977496166,
+   {:mean-ns 97.38050229543614,
+    :variance-ns 80563.4620577909,
     :batch-size 138,
     :num-samples 200}}},
  :assertion-results
- [{:name "chunk-flow: fetchSize32 throughput >= fetchSize1 * 5",
+ [{:name
+   "chunk streaming: chunk-32 absolute (<50ms) and >=1.8x vs chunk-1",
    :pass? true,
-   :ratio 6.85826054497947,
+   :ratio 3.368077445956646,
    :message
-   "ratio=6,86 (need >=5.0), chunk-fetch1=45933200ns, chunk-fetch32=6697500ns"}
-  {:name "INFO: synthetic row-by-row fetchSize32 vs fetchSize1",
-   :pass? true,
-   :ratio 5.948720049691411,
-   :message "ratio=5,95, fetch1=225060900ns, fetch32=37833500ns"}
+   "chunk-32=13387400ns (need <5.0e7), ratio=3,37 (need >=1.8), chunk-1=45089800ns"}
   {:name "INFO: H2 fetchSize32 throughput vs fetchSize1",
    :pass? true,
-   :ratio 4.188397062605805,
-   :message "ratio=4,19, fetch1=109109000ns, fetch32=26050300ns"}
+   :ratio 3.13502879198571,
+   :message "ratio=3,14, fetch1=75294300ns, fetch32=24017100ns"}
   {:name "row->map: zero vary-meta allocations (non-datafy path)",
    :pass? true,
    :ratio nil,
    :message "Verified: row/row->map does not call vary-meta."}
   {:name "row->map: 100-row batch O(N) scaling (<60000ns)",
    :pass? true,
-   :ratio 107.64836423267153,
+   :ratio 104.0814101497504,
    :message
-   "hundred=11169ns (need <60000ns; O(M*N)≈66000+), single=104ns, ratio=107,6"}
+   "hundred=10136ns (need <60000ns; O(M*N)≈66000+), single=97ns, ratio=104,1"}
   {:name "pipeline-fusion: sync-fused-4 sub-50μs",
    :pass? true,
-   :ratio 1.3626129854956008,
-   :message "unfused4=5573ns, fused4=4090ns, ratio=1,36"}
+   :ratio 0.9843144110113775,
+   :message "unfused4=5006ns, fused4=5086ns, ratio=0,98"}
   {:name "metadata-cache: hot-path sub-microsecond (<1000ns)",
    :pass? true,
-   :ratio 188.37209302325581,
-   :message "hotPath=188ns (need <1000ns)"}
+   :ratio 154.25356339084772,
+   :message "hotPath=154ns (need <1000ns)"}
   {:name "row-materialization: vary-meta-free (datafy path only)",
    :pass? true,
    :ratio nil,
@@ -142,4 +127,4 @@
   {:name "execute-each: 1000-param-set throughput sanity gate",
    :pass? true,
    :ratio nil,
-   :message "execute-many-1000 mean=92447200ns"}]}
+   :message "execute-many-1000 mean=85224700ns"}]}

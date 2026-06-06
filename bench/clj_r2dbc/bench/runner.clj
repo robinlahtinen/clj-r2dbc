@@ -46,27 +46,34 @@
         pf  (get results "pipeline-fusion")
         rtm (get results "row-to-map")
         mc  (get results "metadata-cache")]
-    [(let [m1    (mean-ns (:synthetic-chunk-fetch-size-1 ps))
-           m32   (mean-ns (:synthetic-chunk-fetch-size-32 ps))
-           ratio (if (pos? m32) (/ m1 m32) 0.0)]
+    [(let [c1      (mean-ns (:h2-chunk-fetch-size-1 ps))
+           c32     (mean-ns (:h2-chunk-fetch-size-32 ps))
+           ratio   (if (pos? c32) (/ c1 c32) 0.0)
+           ;; Recalibrated after the m/subscribe redesign. The old >=5x relative
+           ;; gate became meaningless because the redesigned per-row path is
+           ;; ~5-10x faster in absolute terms, compressing the ratio. But a pure
+           ;; absolute gate cannot catch a regression of chunk mode back to
+           ;; O(rows) transfers (chunk-32 would creep toward chunk-1 yet stay
+           ;; under any loose ceiling). So gate on BOTH:
+           ;;   - absolute: chunk-32 over 10k rows under a CI-safe ceiling, AND
+           ;;   - relative: chunk-32 still meaningfully beats per-batch chunk-1.
+           ;; chunk-count runs the full public r2dbc/stream path (connection
+           ;; acquire + execute + close per invocation), so a fixed per-invocation
+           ;; cost sits in both measurements and compresses the ratio; observed
+           ;; end-to-end ratio is ~2.3-2.8, so the >=1.8 floor leaves headroom for
+           ;; one-shot noise while still catching an O(rows) regression (ratio ~1).
+           abs-ok? (and (pos? c32) (< c32 5.0e7))
+           rel-ok? (>= ratio 1.8)]
        {:name
-        "chunk-flow: fetchSize32 throughput >= fetchSize1 * 5"
-        :pass?                                                                (>= ratio 5.0)
-        :ratio                                                                ratio
+        "chunk streaming: chunk-32 absolute (<50ms) and >=1.8x vs chunk-1"
+        :pass?                                                                    (and abs-ok? rel-ok?)
+        :ratio                                                                    ratio
         :message
         (format
-         "ratio=%.2f (need >=5.0), chunk-fetch1=%.0fns, chunk-fetch32=%.0fns"
+         "chunk-32=%.0fns (need <5.0e7), ratio=%.2f (need >=1.8), chunk-1=%.0fns"
+         c32
          ratio
-         m1
-         m32)})
-     (let [m1    (mean-ns (:synthetic-fetch-size-1 ps))
-           m32   (mean-ns (:synthetic-fetch-size-32 ps))
-           ratio (if (pos? m32) (/ m1 m32) 0.0)]
-       {:name                                                             "INFO: synthetic row-by-row fetchSize32 vs fetchSize1"
-        :pass?                                                            true
-        :ratio                                                            ratio
-        :message
-        (format "ratio=%.2f, fetch1=%.0fns, fetch32=%.0fns" ratio m1 m32)})
+         c1)})
      (let [m1    (mean-ns (:h2-fetch-size-1 ps))
            m32   (mean-ns (:h2-fetch-size-32 ps))
            ratio (if (pos? m32) (/ m1 m32) 0.0)]

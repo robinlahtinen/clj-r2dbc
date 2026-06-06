@@ -29,9 +29,8 @@
 
   Handles both multi-sample results (:with-jit-warmup, :stats present) and
   single-sample results (:one-shot, no :stats). For :one-shot, the raw elapsed
-  time is read directly from [:samples :metric->values [:elapsed-time]]; the
-  transform is always identity and batch-size is always 1, so no correction is
-  needed."
+  time is read directly from [:samples :elapsed-time] (criterium stores the
+  per-invocation ns there; batch-size is always 1, so no correction is needed)."
   []
   (let [{:keys [data]} (bench/last-bench)]
     (if (contains? data :stats)
@@ -39,7 +38,7 @@
        :variance-ns (helpers/stats-value data :stats :elapsed-time :variance)
        :batch-size  (get-in data [:samples :batch-size])
        :num-samples (get-in data [:samples :num-samples])}
-      {:mean-ns     (first (get-in data [:samples :metric->values [:elapsed-time]]))
+      {:mean-ns     (double (get-in data [:samples :elapsed-time]))
        :variance-ns 0.0
        :batch-size  (get-in data [:samples :batch-size])
        :num-samples (get-in data [:samples :num-samples])})))
