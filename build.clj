@@ -8,6 +8,7 @@
   versions. The default is a SNAPSHOT build."
   (:refer-clojure :exclude [test])
   (:require
+   [clojure.edn :as edn]
    [clojure.java.io :as io]
    [clojure.tools.build.api :as b]
    [deps-deploy.deps-deploy :as dd])
@@ -150,20 +151,34 @@
                 :error-message "Benchmarks failed"})
   opts)
 
+(def ^:private docs-args-file "target/docs-args.edn")
+(def ^:private docs-run-script "target/docs-run.clj")
+
 (defn docs
   "Generate Codox documentation using the project classpath.
 
-  For release builds, override the version so docs reflect the release version.
-  For snapshot builds (the default, e.g. under `verify`), rely on the :docs
-  alias's default :version: passing a quoted EDN string as a process arg is
-  mangled by Windows process-argument quoting (clojure -X then sees a bare,
-  unreadable 0.1.0-SNAPSHOT), and the alias default already matches the snapshot
-  version."
+  The docs version is supplied here from get-version - the single source of
+  truth for the library version - and merged into the static :docs alias config
+  read from deps.edn, so snapshot and release doc builds always reflect the real
+  version (the alias no longer carries its own, driftable :version literal).
+
+  Codox is invoked through a generated script that reads its argument map from a
+  temp EDN file rather than from a CLI arg, because Windows process-argument
+  quoting mangles EDN string args passed to `clojure -X`: a quoted :version
+  arrives as an unreadable bare token regardless of escaping."
   [opts]
-  (run-command {:command-args  (cond-> ["clojure" "-X:docs"]
-                                 (:release opts)
-                                 (conj ":version" (pr-str (get-version opts))))
-                :error-message "Docs generation failed"})
+  (let [args (-> (slurp "deps.edn")
+                 edn/read-string
+                 (get-in [:aliases :docs :exec-args])
+                 (assoc :version (get-version opts)))]
+    (io/make-parents docs-args-file)
+    (spit docs-args-file (pr-str args))
+    (spit docs-run-script
+          (str "(require 'codox.main 'clojure.edn)\n"
+               "(codox.main/generate-docs\n"
+               " (clojure.edn/read-string (slurp \"" docs-args-file "\")))\n"))
+    (run-command {:command-args  ["clojure" "-M:docs" docs-run-script]
+                  :error-message "Docs generation failed"}))
   opts)
 
 (defn verify

@@ -55,10 +55,11 @@
   :format {:deps       {dev.weavejester/cljfmt {:mvn/version "0.16.4"}}
            :ns-default cljfmt.tool
            :exec-args  {:paths ["src" "test" "bench" "build.clj"]}}
+  ;; :version is intentionally omitted: `clojure -T:build docs` injects it from
+  ;; build.clj (the single source of truth) when generating documentation.
   :docs   {:extra-deps {codox/codox {:mvn/version "0.10.8"}}
            :exec-fn    codox.main/generate-docs
            :exec-args  {:name         "clj-r2dbc"
-                        :version      "0.1.0-SNAPSHOT"
                         :description  "A modern low-level Clojure wrapper for non-blocking, R2DBC-based access to databases."
                         :license      {:name "MIT License"
                                        :url  "https://github.com/robinlahtinen/clj-r2dbc/blob/main/LICENSE"}
