@@ -34,12 +34,13 @@
   Converts silent CI kills into fast diagnostic failures by capturing all thread
   stacks when the task does not complete within the timeout.
 
-  The task runs on a dedicated DAEMON thread (not the non-daemon agent send-off
-  pool used by `future`). A lost-wakeup hang therefore cannot keep the JVM alive
-  after this throws — the orphaned daemon thread dies with the JVM, so CI fails
-  fast with the dump already captured instead of hanging until cancellation. The
-  hung task is deliberately NOT cancelled/interrupted on timeout, so the natural
-  quiescent state is preserved for the captured dump and any trace log.
+  The task is started via its raw (success failure) protocol so its canceller is
+  captured. On timeout the dump is printed FIRST (preserving the quiescent state
+  for diagnosis), THEN the task is cancelled before throwing. Cancellation
+  propagates through the streaming flow's Reactor usingWhen, which cancels
+  create()/execute() and closes the connection — so a hung task does not leave
+  orphaned flows pinning resources, and CI fails in ~timeout-ms instead of
+  hanging until the job is force-cancelled.
 
   Args:
     timeout-ms - deadline in milliseconds before dumping stacks and throwing
@@ -48,24 +49,19 @@
   Returns the task result on success. Throws ExceptionInfo with thread dump on timeout."
   [timeout-ms task]
   (let [result    (promise)
-        ^Thread t (Thread. ^Runnable
-                   (fn []
-                     (deliver result
-                              (try [::ok (run-task! task)]
-                                   (catch Throwable e [::err e])))))]
-    (.setName t "run-task-timeout")
-    (.setDaemon t true)
-    (.start t)
-    (let [res (deref result timeout-ms ::timeout)]
-      (if (= res ::timeout)
-        (do
-          (println "\n=== TIMEOUT after" timeout-ms "ms — JVM thread dump ===")
-          (doseq [[^Thread th stack] (Thread/getAllStackTraces)]
-            (println (str "\nThread: " (.getName th) " state=" (.getState th)))
-            (run! #(println "  " %) stack))
-          (throw (ex-info "concurrent test timed out" {:timeout-ms timeout-ms})))
-        (let [[kind v] res]
-          (if (= kind ::err) (throw v) v))))))
+        canceller (task (fn [v] (deliver result [::ok v]))
+                        (fn [e] (deliver result [::err e])))
+        res       (deref result timeout-ms ::timeout)]
+    (if (= res ::timeout)
+      (do
+        (println "\n=== TIMEOUT after" timeout-ms "ms — JVM thread dump ===")
+        (doseq [[^Thread th stack] (Thread/getAllStackTraces)]
+          (println (str "\nThread: " (.getName th) " state=" (.getState th)))
+          (run! #(println "  " %) stack))
+        (canceller)
+        (throw (ex-info "concurrent test timed out" {:timeout-ms timeout-ms})))
+      (let [[kind v] res]
+        (if (= kind ::err) (throw v) v)))))
 
 (defn- subscribe-consume
   "Subscribe to an R2DBC Publisher and consume all values, returning nil

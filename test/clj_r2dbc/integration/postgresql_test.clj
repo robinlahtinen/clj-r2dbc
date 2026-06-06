@@ -4,11 +4,35 @@
 (ns clj-r2dbc.integration.postgresql-test
   (:require
    [clj-r2dbc :as r2dbc]
+   [clj-r2dbc.impl.sql.cursor :as cursor]
+   [clj-r2dbc.impl.sql.row :as row]
    [clj-r2dbc.integration.fixtures :as fx]
    [clojure.test :refer [deftest is testing]]
    [missionary.core :as m]))
 
 (set! *warn-on-reflection* true)
+
+(deftest ^:integration postgresql-flyweight-many-rows-test
+  ;; Regression guard for the flyweight ByteBuf use-after-free that only surfaces
+  ;; on a real Netty driver once pooled ByteBufs are recycled (the 3-row fixtures
+  ;; never trigger it). Streams many rows in flyweight mode (no :builder-fn) and
+  ;; asserts every materialised value is correct - garbage from a freed ByteBuf
+  ;; would corrupt :id/:name while keeping the row count.
+  (let [db (fx/pg-db)]
+    (when (fx/skip-unless-db! db "CLJ_R2DBC_TEST_PG_URL" "PostgreSQL")
+      (testing "flyweight streaming materialises correct values across ByteBuf pool reuse"
+        (let [n    20000
+              sql  (str "SELECT g AS id, ('name-' || g) AS name"
+                        " FROM generate_series(1, " n ") g ORDER BY g")
+              rows (fx/run-task!
+                    (m/reduce (fn [acc cursor]
+                                (conj acc (row/row->map (cursor/cursor-row cursor)
+                                                        (cursor/cursor-cache cursor))))
+                              []
+                              (r2dbc/stream db sql {:params [], :stream-mode :flyweight})))]
+          (is (= n (count rows)))
+          (is (= (range 1 (inc n)) (map :id rows)))
+          (is (every? (fn [r] (= (str "name-" (:id r)) (:name r))) rows)))))))
 
 (deftest ^:integration postgresql-byodb-smoke-test
   (let [db (fx/pg-db)]
