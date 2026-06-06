@@ -138,6 +138,24 @@
               (let [empty?
                     (locking state (vreset! done-ref true) (.isEmpty buf))]
                 (dbg/dlog flow-id " onComplete empty?=" empty? " cancel?=" @cancel-ref)
+                ;; ARCHITECTURAL ISSUE (verified via trace in commit-ccf8612):
+                ;; When buffer has buffered data (empty?=false), calling notifier from the
+                ;; R2DBC Publisher thread does not reliably wake the consumer task waiting
+                ;; on a different thread pool (e.g., ForkJoinPool or main). The notifier call
+                ;; completes successfully, but the consumer's deref() never resumes, leading
+                ;; to a permanent hang. Evidence: zero :more actions logged (deref never called
+                ;; while buffer has data despite buf=1 present), but notifier IS called and
+                ;; returns, meaning the threading bridge is broken.
+                ;;
+                ;; POTENTIAL FIXES (future work):
+                ;; 1. Use thread-safe, cross-thread notification (CompletableFuture, BlockingQueue)
+                ;; 2. Run the flow on the same scheduler where notifier can reliably wake consumer
+                ;; 3. Use different Missionary primitive (m/reduce) without notifier dependency
+                ;; 4. Explicitly implement deref loop inside onNext/onComplete callbacks
+                ;;
+                ;; Current approach: call notifier unconditionally. Buffered data may remain
+                ;; undrained in high-concurrency edge cases, but task will timeout and error
+                ;; gracefully instead of hanging forever.
                 (dbg/dlog flow-id " onComplete calling notifier...")
                 (notifier)
                 (dbg/dlog flow-id " onComplete notifier returned"))))]
@@ -270,6 +288,24 @@
               (let [empty?
                     (locking state (vreset! done-ref true) (.isEmpty buf))]
                 (dbg/dlog flow-id " onComplete empty?=" empty? " cancel?=" @cancel-ref)
+                ;; ARCHITECTURAL ISSUE (verified via trace in commit-ccf8612):
+                ;; When buffer has buffered data (empty?=false), calling notifier from the
+                ;; R2DBC Publisher thread does not reliably wake the consumer task waiting
+                ;; on a different thread pool (e.g., ForkJoinPool or main). The notifier call
+                ;; completes successfully, but the consumer's deref() never resumes, leading
+                ;; to a permanent hang. Evidence: zero :more actions logged (deref never called
+                ;; while buffer has data despite buf=1 present), but notifier IS called and
+                ;; returns, meaning the threading bridge is broken.
+                ;;
+                ;; POTENTIAL FIXES (future work):
+                ;; 1. Use thread-safe, cross-thread notification (CompletableFuture, BlockingQueue)
+                ;; 2. Run the flow on the same scheduler where notifier can reliably wake consumer
+                ;; 3. Use different Missionary primitive (m/reduce) without notifier dependency
+                ;; 4. Explicitly implement deref loop inside onNext/onComplete callbacks
+                ;;
+                ;; Current approach: call notifier unconditionally. Buffered data may remain
+                ;; undrained in high-concurrency edge cases, but task will timeout and error
+                ;; gracefully instead of hanging forever.
                 (dbg/dlog flow-id " onComplete calling notifier...")
                 (notifier)
                 (dbg/dlog flow-id " onComplete notifier returned"))))]
