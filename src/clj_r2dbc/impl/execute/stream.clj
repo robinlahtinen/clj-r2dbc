@@ -138,7 +138,7 @@
               (let [empty?
                     (locking state (vreset! done-ref true) (.isEmpty buf))]
                 (dbg/dlog flow-id " onComplete empty?=" empty? " cancel?=" @cancel-ref)
-                (if empty? (signal-terminator!) (notifier)))))]
+                (signal-terminator!))))]
       (CompletableFuture/runAsync (fn []
                                     (.subscribe ^Publisher row-pub subscriber))
                                   m/blk)
@@ -268,7 +268,7 @@
               (let [empty?
                     (locking state (vreset! done-ref true) (.isEmpty buf))]
                 (dbg/dlog flow-id " onComplete empty?=" empty? " cancel?=" @cancel-ref)
-                (if empty? (signal-terminator!) (notifier)))))]
+                (signal-terminator!))))]
       (CompletableFuture/runAsync (fn []
                                     (.subscribe ^Publisher row-pub subscriber))
                                   m/blk)
