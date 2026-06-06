@@ -23,9 +23,7 @@
    [missionary.core :as m])
   (:import
    (io.r2dbc.spi Result)
-   (java.util ArrayList)
    (java.util.concurrent CompletableFuture CompletionException ExecutionException)
-   (java.util.concurrent.atomic AtomicBoolean)
    (java.util.function BiConsumer BiFunction)
    (org.reactivestreams Publisher Subscriber Subscription)))
 
@@ -129,23 +127,22 @@
   Demand-driven and RS-compliant for a conformant upstream (delivers at most the
   requested count): each downstream request(d) collects d batches, requesting
   chunk-size upstream per batch. onComplete flushes any partial final batch.
-  Errors and cancellation propagate to/from upstream. Terminal signals fire once.
-
-  Args:
-    upstream   - Publisher<T> to batch.
-    chunk-size - positive number of items per emitted vector."
+  Errors and cancellation propagate to/from upstream. Terminal signals fire once:
+  the lock-guarded done flag also elects the single thread that may signal
+  downstream termination, so no separate atomic is needed. All buf access is
+  serialized by the state monitor, which lets a transient vector accumulate
+  batches without the O(chunk-size) copy a mutable list + vec would cost."
   ^Publisher [^Publisher upstream ^long chunk-size]
   (reify
     Publisher
     (subscribe [_ downstream]
       (let [state                                                                   (Object.)
-            ^ArrayList buf                                                          (ArrayList. (int chunk-size))
+            buf                                                                     (volatile! (transient []))
             up-sub                                                                  (volatile! nil)
             demand                                                                  (long-array 1)
             collecting                                                              (volatile! false)
             done                                                                    (volatile! false)
             cancelled                                                               (volatile! false)
-            ^AtomicBoolean term                                                     (AtomicBoolean. false)
             start-collect!
             (fn []
               (let [^Subscription s
@@ -167,10 +164,10 @@
               (onNext [_ x]
                 (let [batch (locking state
                               (when-not (or @cancelled @done)
-                                (.add buf x)
-                                (when (>= (.size buf) chunk-size)
-                                  (let [v (vec buf)]
-                                    (.clear buf)
+                                (vswap! buf conj! x)
+                                (when (>= (count @buf) chunk-size)
+                                  (let [v (persistent! @buf)]
+                                    (vreset! buf (transient []))
                                     (aset demand 0 (unchecked-dec (aget demand 0)))
                                     (vreset! collecting false)
                                     v))))]
@@ -178,15 +175,18 @@
                     (.onNext ^Subscriber downstream batch)
                     (start-collect!))))
               (onError [_ t]
-                (locking state (vreset! done true))
-                (when (.compareAndSet term false true)
-                  (.onError ^Subscriber downstream t)))
+                (let [won? (locking state
+                             (when-not @done (vreset! done true) true))]
+                  (when won?
+                    (.onError ^Subscriber downstream t))))
               (onComplete [_]
-                (let [tail (locking state
-                             (vreset! done true)
-                             (when (pos? (.size buf))
-                               (let [v (vec buf)] (.clear buf) v)))]
-                  (when (.compareAndSet term false true)
+                (let [[won? tail] (locking state
+                                    (if @done
+                                      [false nil]
+                                      (do (vreset! done true)
+                                          [true (when (pos? (count @buf))
+                                                  (persistent! @buf))])))]
+                  (when won?
                     (when tail (.onNext ^Subscriber downstream tail))
                     (.onComplete ^Subscriber downstream)))))]
         (.onSubscribe

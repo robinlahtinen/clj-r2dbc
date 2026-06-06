@@ -72,6 +72,19 @@
                   (onComplete [_])))
     (catch Throwable _ nil)))
 
+(defn- result-flow
+  "Shared bridge skeleton for result-rows-flow and result-chunks-flow.
+
+  Consumes the Publisher<Result> one Result at a time (m/?> defaults to
+  parallelism 1) and, for each Result, consumes the per-Result Publisher built
+  by make-row-pub one value at a time. Both subscriptions are dispatched on m/blk
+  (pub/async-subscribe-pub). make-row-pub is a 1-arity fn [Result] -> Publisher
+  that selects per-row vs batched emission."
+  [^Publisher result-pub make-row-pub]
+  (m/ap
+   (let [^Result result (m/?> (m/subscribe (pub/async-subscribe-pub result-pub)))]
+     (m/?> (m/subscribe (pub/async-subscribe-pub (make-row-pub result)))))))
+
 (defn result-rows-flow
   "Return a Missionary discrete flow emitting transformed rows from every Result
   produced by result-pub, flattened in order.
@@ -96,10 +109,7 @@
     result-pub - Publisher<Result> from Statement.execute().
     row-xf     - 1-arity fn [Row] -> value applied to each row."
   [^Publisher result-pub row-xf]
-  (m/ap
-   (let [^Result result (m/?> (m/subscribe (pub/async-subscribe-pub result-pub)))]
-     (m/?> (m/subscribe (pub/async-subscribe-pub
-                         (pub/result-row-pub result row-xf)))))))
+  (result-flow result-pub #(pub/result-row-pub % row-xf)))
 
 (defn result-chunks-flow
   "Like result-rows-flow, but emits one vector of up to chunk-size transformed
@@ -116,11 +126,8 @@
     row-xf     - 1-arity fn [Row] -> value applied to each row.
     chunk-size - positive number of rows per emitted vector."
   [^Publisher result-pub row-xf ^long chunk-size]
-  (m/ap
-   (let [^Result result (m/?> (m/subscribe (pub/async-subscribe-pub result-pub)))]
-     (m/?> (m/subscribe (pub/async-subscribe-pub
-                         (pub/buffer-pub (pub/result-row-pub result row-xf)
-                                         chunk-size)))))))
+  (result-flow result-pub
+               #(pub/buffer-pub (pub/result-row-pub % row-xf) chunk-size)))
 
 (defn streaming-plan-flow
   "Return a Missionary discrete flow emitting transformed rows with end-to-end
