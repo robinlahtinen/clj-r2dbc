@@ -90,6 +90,15 @@
         (aset types i (or (.getJavaType cm) Object))))
     (RowMetadataCache. ks types n)))
 
+(defn build-name-index
+  "Build a {column-name-string -> column-index} map from a RowMetadata, used by
+  the flyweight cursor's name-based Row.get. Built once per result set."
+  [^RowMetadata rmd]
+  (persistent!
+   (reduce-kv (fn [m i ^ColumnMetadata cm] (assoc! m (.getName cm) i))
+              (transient {})
+              (vec (.getColumnMetadatas rmd)))))
+
 (defn row->map
   "Convert an R2DBC Row to a persistent Clojure map using a pre-built cache.
 

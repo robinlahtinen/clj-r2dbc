@@ -10,29 +10,30 @@
                :chunk-size batch (when :chunk-size supplied). Renamed from plan*.
 
   Note: RowCursor is a shared mutable object. The same instance is mutated for
-  every row emitted by stream*. Retaining a reference to the cursor beyond the
-  current m/?> boundary silently returns data from a later row - no exception
-  is thrown. Callers that need to keep row data must either:
+  every row emitted by stream*. A cursor-row read outside the reduce step that
+  produced it throws IllegalStateException (the generation guard). Callers that
+  need to keep row data must either:
     (a) supply :builder-fn (recommended) to materialize an immutable value, or
     (b) call (cursor-row c) and (cursor-cache c) immediately within the same
         reduce step and pass them to impl/sql/row's row->map before the next
         row arrives.
 
   Backpressure architecture:
-    stream* delegates row delivery to lifecycle/result-rows-flow, which bridges
-    R2DBC's push-based Publisher<Result> into a demand-driven Missionary discrete
-    flow via Missionary's reactive-streams adapter (m/subscribe). Reactive demand
-    is one row at a time; database round-trip batching is controlled independently
-    by Statement.fetchSize (applied in stmt/prepare!).
+    stream* delegates to lifecycle/streaming-plan-flow, which flattens R2DBC's
+    push-based Publisher<Result> into a Publisher of rows below the bridge (Reactor
+    concatMap) and exposes it as a single demand-driven Missionary discrete flow
+    via m/subscribe. Reactive demand is one row at a time; database round-trip
+    batching is controlled independently by Statement.fetchSize (applied in
+    stmt/prepare!).
 
     Backpressure chain:
-      consumer m/reduce -> m/?> result-rows-flow -> m/subscribe(Publisher<Row>)
+      consumer m/reduce -> m/subscribe(rows Publisher) -> concatMap
         -> Subscription.request(1) -> R2DBC driver -> database cursor
 
-    Chunking (:chunk-size) batches at the Reactive Streams layer via
-    lifecycle/result-chunks-flow (publisher/buffer-pub) so the consumer performs
-    O(batches) transfers; flyweight mode maps each row onto a shared RowCursor.
-    No eager collection - rows stream from database to consumer.
+    Chunking (:chunk-size) is a partition-all transducer (m/eduction) over the
+    per-row flow, so the consumer performs O(batches) transfers; flyweight mode
+    maps each row onto a shared RowCursor. No eager collection - rows stream from
+    database to consumer.
 
   This namespace is an implementation detail; do not use from application code."
   (:require
@@ -45,8 +46,7 @@
    [missionary.core :as m])
   (:import
    (clj_r2dbc.impl.connection ConnectableWithOpts)
-   (io.r2dbc.spi Connection ConnectionFactory Row)
-   (java.util ArrayDeque)))
+   (io.r2dbc.spi Connection ConnectionFactory Row)))
 
 (set! *warn-on-reflection* true)
 (set! *unchecked-math* :warn-on-boxed)
@@ -65,9 +65,9 @@
   Use clj-r2dbc.row/kebab-maps for standard kebab-case row maps.
 
   With :chunk-size - requires :builder-fn; emits one vector of up to chunk-size
-  built values per emission (the final vector may be shorter). Batching happens
-  at the Reactive Streams layer (lifecycle/result-chunks-flow via buffer-pub) so
-  the consumer performs O(batches) transfers.
+  built values per emission (the final vector may be shorter). Batching is a
+  partition-all transducer over the per-row flow, so the consumer performs
+  O(batches) transfers.
 
   Args:
     db     - ConnectionFactory, Connection, or ConnectableWithOpts.
@@ -84,9 +84,9 @@
                :returning  - calls Statement.returnGeneratedValues.
 
   Connection lifecycle:
-    When db is a ConnectionFactory, stream* acquires a connection at flow start
-    and closes it on completion, error, or cancellation (via close-conn-flow on
-    the flow terminator). When db is already a Connection, lifecycle is owned by
+    When db is a ConnectionFactory, stream* acquires a connection on subscription
+    and closes it on completion, error, or cancellation (via Reactor usingWhen in
+    streaming-plan-flow). When db is already a Connection, lifecycle is owned by
     the caller; Connection.close() is NOT called.
 
   Backpressure:
@@ -113,8 +113,8 @@
                             {:clj-r2dbc/error   :clj-r2dbc/missing-key
                              :clj-r2dbc/context :stream
                              :key               :builder-fn})))
-          ;; :chunk-size selects result-chunks-flow in streaming-plan-flow;
-          ;; statement fetch batching is aligned to chunk-size.
+          ;; :chunk-size in opts selects chunked-pub (Reactor buffer) below the
+          ;; bridge in streaming-plan-flow; statement fetch batching is aligned.
           (lifecycle/streaming-plan-flow
            db
            sql
@@ -133,25 +133,30 @@
          (builder-fn row (.getMetadata row))))
 
       :else
-      (let [crs            (cursor/->RowCursor (ArrayDeque. 2) nil 0)
+      (let [crs            (cursor/->cursor)
             flyweight-opts (assoc opts :fetch-size 1)]
-        (m/eduction
-         (map (fn cursor-step [^Row row]
-                (when (nil? (cursor/cursor-cache crs))
-                  (let [q   (:qualifier opts :unqualified-kebab)
-                        rmd (.getMetadata ^Row row)
-                        qfn (fn qualify-fn [^String col _]
-                              (row/qualify-column col nil q))]
-                    (cursor/-set-cache!
-                     crs
-                     (row/build-metadata-cache rmd qfn))))
-                (cursor/-set-row! crs row)
-                crs))
-         (lifecycle/streaming-plan-flow db
-                                        sql
-                                        params
-                                        flyweight-opts
-                                        identity))))))
+        ;; cursor-step is the row-xf, applied inside result-row-pub's .map while
+        ;; the Row's ByteBuf is live: it materialises the row's column values into
+        ;; the cursor's reused storage (capture!) and emits the shared cursor. The
+        ;; flow is consumed directly (no m/eduction, which races m/subscribe and
+        ;; pre-advances upstream); reads never touch a released ByteBuf.
+        (lifecycle/streaming-plan-flow
+         db
+         sql
+         params
+         flyweight-opts
+         (fn cursor-step [^Row row]
+           (when (nil? (cursor/cursor-cache crs))
+             (let [q   (:qualifier opts :unqualified-kebab)
+                   rmd (.getMetadata ^Row row)
+                   qfn (fn qualify-fn [^String col _]
+                         (row/qualify-column col nil q))]
+               (cursor/-set-meta! crs
+                                  (row/build-metadata-cache rmd qfn)
+                                  (row/build-name-index rmd)
+                                  rmd)))
+           (cursor/-capture! crs row)
+           crs))))))
 
 (extend-protocol proto/Streamable
   ConnectionFactory

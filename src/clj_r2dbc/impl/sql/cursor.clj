@@ -6,15 +6,24 @@
 
   Provides:
     Cursor          - protocol for type-safe access to mutable RowCursor fields.
-    GenerationGuard - Row wrapper built by cursor-row; guards against stale reads
+    GenerationGuard - Row view returned by cursor-row; reads the cursor's
+                      materialised column values and guards against stale reads
                       after the cursor advances to the next row.
     RowCursor       - shared mutable flyweight constructed once per stream* call;
                       reused for every row emitted.
 
+  Zero-copy without dangling ByteBufs: column values are read into the cursor's
+  reused Object[] storage by capture! INSIDE result-row-pub's Result.map - while
+  the Row's backing ByteBuf is live - rather than stashing a raw Row to read in
+  the consumer step (which reads freed memory once the row publisher advances and
+  releases the ByteBuf; see impl/connection/lifecycle). cursor-row then reads the
+  already-materialised values, so it is safe regardless of when the consumer
+  reads relative to the publisher's release.
+
   Note: RowCursor is a shared mutable object. The same instance is mutated for
-  every row emitted by stream*. Retaining a reference to the cursor beyond the
-  current m/?> boundary silently returns data from a later row - no exception is
-  thrown. Callers that need to keep row data must either:
+  every row emitted by stream*. Retaining a cursor-row beyond the current step
+  reads the next row's values - the GenerationGuard throws IllegalStateException
+  in that case. Callers that need to keep row data must either:
     (a) supply :builder-fn (recommended) to materialize an immutable value, or
     (b) call cursor-row and cursor-cache immediately within the same reduce step
         and pass them to impl/sql/row's row->map before the next row arrives.
@@ -24,8 +33,7 @@
    [clj-r2dbc.impl.sql.row])
   (:import
    (clj_r2dbc.impl.sql.row RowMetadataCache)
-   (io.r2dbc.spi Row)
-   (java.util ArrayDeque)))
+   (io.r2dbc.spi Row RowMetadata)))
 
 (set! *warn-on-reflection* true)
 (set! *unchecked-math* :warn-on-boxed)
@@ -35,15 +43,23 @@
   Used by callers that consume the flyweight cursor directly (e.g., tests,
   custom reduction functions)."
   (cursor-row [this]
-    "Return the current Row (valid only within the current step).")
+    "Return a Row view of the current materialised values (valid only within the
+    current step).")
   (cursor-cache [this]
     "Return the current RowMetadataCache.")
   (cursor-generation [this]
     "Return the monotonic cursor generation.")
-  (-set-row! [this row]
-    "Internal: enqueue row for the next consumer step.")
-  (-set-cache! [this cache]
-    "Internal: update the RowMetadataCache in place."))
+  (-values [this]
+    "Internal: the cursor's reused column-value array.")
+  (-name->idx [this]
+    "Internal: the column-name -> index map.")
+  (-row-metadata [this]
+    "Internal: the current RowMetadata.")
+  (-capture! [this row]
+    "Internal: read row's columns into the reused value array, advancing the
+    generation. Must be called while the Row's ByteBuf is live (in Result.map).")
+  (-set-meta! [this cache name->idx rmd]
+    "Internal: install the per-result metadata (built once on the first row)."))
 
 (defn- stale-row-ex
   []
@@ -51,42 +67,43 @@
 
 (deftype
  ^{:doc
-   "A Row wrapper that guards against stale reads.
+   "A Row view over the cursor's materialised values that guards against stale
+   reads.
 
    Fields:
-     row        - the underlying Row delegate.
      generation - the cursor generation at the time this guard was created.
-     cursor     - the RowCursor whose generation is checked on each access.
+     cursor     - the RowCursor whose generation and values are read.
 
-   Delegates all Row.get calls to the underlying row only if the cursor
-   generation matches; throws IllegalStateException otherwise. Used in
-   flyweight streaming mode to detect out-of-step row access."}
+   Reads the cursor's reused value array by index (or by name via the cursor's
+   name->index map) only if the cursor generation still matches; throws
+   IllegalStateException otherwise. Used in flyweight streaming mode to detect
+   out-of-step row access."}
  GenerationGuard
- [^Row row ^long generation cursor]
+ [^long generation cursor]
   Row
   (^Object get
     [_ ^int index]
     (if (= generation (cursor-generation cursor))
-      (.get row index)
+      (aget ^objects (-values cursor) index)
       (throw (stale-row-ex))))
   (^Object get
     [_ ^String name]
     (if (= generation (cursor-generation cursor))
-      (.get row name)
+      (aget ^objects (-values cursor) (int (get (-name->idx cursor) name)))
       (throw (stale-row-ex))))
   (^Object get
-    [_ ^int index ^Class type]
+    [_ ^int index ^Class _type]
     (if (= generation (cursor-generation cursor))
-      (.get row index type)
+      (aget ^objects (-values cursor) index)
       (throw (stale-row-ex))))
   (^Object get
-    [_ ^String name ^Class type]
+    [_ ^String name ^Class _type]
     (if (= generation (cursor-generation cursor))
-      (.get row name type)
+      (aget ^objects (-values cursor) (int (get (-name->idx cursor) name)))
       (throw (stale-row-ex))))
   (getMetadata [_]
     (if (= generation (cursor-generation cursor))
-      (.getMetadata row)
+      (-row-metadata cursor)
       (throw (stale-row-ex)))))
 
 (deftype
@@ -94,36 +111,52 @@
    "Shared mutable cursor passed as the per-step value in flyweight streaming.
 
    Fields:
-     _row-queue  - queue of pending rows (ArrayDeque).
+     _values     - reused Object[] of the current row's materialised column
+                   values (unsynchronized-mutable; grown to col-count on first
+                   capture).
      _cache      - the current RowMetadataCache (unsynchronized-mutable).
-     _generation - monotonic counter incremented on each row advance (volatile).
+     _name->idx  - column-name -> index map (unsynchronized-mutable).
+     _rmd        - the current RowMetadata (unsynchronized-mutable).
+     _generation - monotonic counter incremented on each capture (volatile).
 
-   Holds a queue of pending rows, the current RowMetadataCache, and a
-   monotonic generation counter. Each m/?> deref advances to the next row;
-   all access outside the current step is guarded by GenerationGuard."}
+   capture! materialises the row's columns into _values while the ByteBuf is
+   live; all access outside the current step is guarded by GenerationGuard."}
  RowCursor
- [^ArrayDeque _row-queue ^:unsynchronized-mutable ^RowMetadataCache _cache
+ [^:unsynchronized-mutable ^objects _values
+  ^:unsynchronized-mutable ^RowMetadataCache _cache
+  ^:unsynchronized-mutable _name->idx
+  ^:unsynchronized-mutable ^RowMetadata _rmd
   ^:volatile-mutable ^long _generation]
   Cursor
-  (cursor-row [this]
-    (let [^Row r (.pollFirst _row-queue)]
-      (when r (->GenerationGuard r _generation this))))
+  (cursor-row [this] (->GenerationGuard _generation this))
   (cursor-cache [_] _cache)
   (cursor-generation [_] _generation)
-  (-set-row! [this r]
-    (set! _generation (unchecked-inc _generation))
-    (.addLast _row-queue r)
-    this)
-  (-set-cache! [this c] (set! _cache c) this))
+  (-values [_] _values)
+  (-name->idx [_] _name->idx)
+  (-row-metadata [_] _rmd)
+  (-capture! [this row]
+    (let [^RowMetadataCache c        _cache
+          n                          (.col-count c)
+          ^"[Ljava.lang.Object;" tys (.java-types c)
+          ^"[Ljava.lang.Object;" vs  (if (and _values (= (alength ^objects _values) n))
+                                       _values
+                                       (object-array n))]
+      (dotimes [i n]
+        (aset vs i (.get ^Row row (int i) ^Class (aget tys i))))
+      (set! _values vs)
+      (set! _generation (unchecked-inc _generation))
+      this))
+  (-set-meta! [this cache name->idx rmd]
+    (set! _cache cache)
+    (set! _name->idx name->idx)
+    (set! _rmd rmd)
+    this))
+
+(defn ->cursor
+  "Construct an empty RowCursor for one stream* invocation."
+  []
+  (->RowCursor nil nil nil nil 0))
 
 (comment
-  (def crs (->RowCursor (java.util.ArrayDeque. 2) nil 0))
-  (cursor-generation crs)
-  (-set-row! crs ::fake-row)
-  (cursor-generation crs)
-  (def guarded (cursor-row crs))
-  (cursor-row crs)
-  (-set-row! crs ::next-row)
-  (cursor-generation crs)
-  (-set-cache! crs ::some-cache)
-  (cursor-cache crs))
+  (def crs (->cursor))
+  (cursor-generation crs))

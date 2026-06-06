@@ -2,181 +2,146 @@
 ;;  Licensed under the MIT License. See LICENSE in the project root for license information.
 
 (ns clj-r2dbc.impl.connection.lifecycle
-  "Connection lifecycle management for streaming plan flows.
+  "Connection lifecycle and the Publisher<Result> -> row flow bridge for streaming.
 
-  When db is a ConnectionFactory: connection is acquired on flow start and
-  closed on termination (normal/error/cancel).
-  When db is already a Connection: the caller owns the lifecycle;
+  When db is a ConnectionFactory: a connection is acquired on subscription and
+  closed on termination (normal completion, error, or cancellation), driven by
+  Reactor's Flux/usingWhen resource operator.
+  When db is already a Connection: the caller owns the lifecycle and
   Connection.close() is NOT called.
 
-  This namespace owns stream connection lifecycle transitions and the
-  Publisher<Result> -> row flow bridge (result-rows-flow), built on Missionary's
-  reactive-streams adapter (m/subscribe). Chunking and flyweight transforms are
-  applied by the caller (impl/execute/stream) via m/eduction.
+  Flatten strategy: a Publisher<Result> is flattened to a Publisher of row values
+  at the Reactive Streams layer via Reactor concatMap (ordered, prefetch 1), then
+  bridged to a single Missionary discrete flow with m/subscribe. The flow is
+  consumed by the caller's m/reduce (a non-forking consumer).
+
+  Why not m/?> over m/subscribe: forking a discrete flow built from m/subscribe
+  with m/?> (Ambiguous) races a synchronous publisher's re-entrant onNext against
+  the fork and intermittently drops a wakeup, hanging the flow under concurrency
+  (reproduced on constrained cores). Consuming the single m/subscribe flow with
+  m/reduce instead - and doing all flattening below the bridge with concatMap -
+  removes every m/?>-over-m/subscribe site. Database fetch batching is governed
+  independently by Statement.fetchSize (see statement/apply-opts!).
 
   This namespace is an implementation detail; do not use from application code."
   (:require
-   [clj-r2dbc.debug-log :as dbg]
-   [clj-r2dbc.impl.connection :as conn]
    [clj-r2dbc.impl.connection.publisher :as pub]
    [clj-r2dbc.impl.sql.statement :as stmt]
    [missionary.core :as m])
   (:import
-   (io.r2dbc.spi Connection Result Statement)
-   (org.reactivestreams Publisher Subscriber Subscription)))
+   (io.r2dbc.spi Connection ConnectionFactory Statement)
+   (java.util.function Function Supplier)
+   (org.reactivestreams Publisher)
+   (reactor.core.publisher Flux)))
 
 (set! *warn-on-reflection* true)
 
-(defn- close-conn-flow
-  "Wrap inner-flow so that when its terminator fires (normal completion, error,
-  or cancellation), Connection.close() is invoked once and the wrapper's
-  terminator fires when the close Publisher<Void> completes.
+(defn- rows-pub
+  "Flatten a Publisher<Result> into a Publisher of row values.
 
-  The wrapper passes through invoke (cancel) and deref to inner-flow unchanged;
-  only the terminator is intercepted. inner-flow's signal-terminator! uses an
-  AtomicBoolean to guarantee wrapped-term fires at most once."
-  [inner-flow ^Connection conn]
-  (fn [notifier terminator]
-    (let [conn-id                                                                  (str "CC" (Integer/toHexString (System/identityHashCode conn)))
-          wrapped-term
-          (fn []
-            (dbg/dlog conn-id " wrapped-term ENTER -> subscribe (.close conn)")
-            (.subscribe ^Publisher (.close conn)
-                        (reify
-                          Subscriber
-                          (onSubscribe [_ s]
-                            (.request ^Subscription s Long/MAX_VALUE))
-                          (onNext [_ _])
-                          (onError [_ t]
-                            (dbg/dlog conn-id " close onError -> terminator type="
-                                      (.getSimpleName (class t)))
-                            (terminator))
-                          (onComplete [_]
-                            (dbg/dlog conn-id " close onComplete -> terminator")
-                            (terminator)))))]
-      (inner-flow notifier wrapped-term))))
+  Uses Reactor concatMap (ordered, so multi-Result output preserves Result order)
+  with prefetch 1, so row-level demand stays request(1) and no rows are buffered
+  across the bridge - preserving fetch-size-1 backpressure and flyweight-mode
+  ByteBuf safety. row-xf is applied inside each Result.map via pub/result-row-pub,
+  while the Row's backing ByteBuf is guaranteed live."
+  ^Publisher [^Publisher result-pub row-xf]
+  (.concatMap (Flux/from result-pub)
+              (reify Function
+                (apply [_ result] (pub/result-row-pub result row-xf)))
+              1))
 
-(defn- fire-and-forget-close!
-  "Subscribe to Connection.close() and discard the result. Used on the error
-  path between connection acquisition and row-flow construction, when no flow
-  exists yet to own the close lifecycle."
-  [^Connection conn]
-  (try
-    (.subscribe ^Publisher (.close conn)
-                (reify
-                  Subscriber
-                  (onSubscribe [_ s]
-                    (.request ^Subscription s Long/MAX_VALUE))
-                  (onNext [_ _])
-                  (onError [_ _])
-                  (onComplete [_])))
-    (catch Throwable _ nil)))
+(defn- chunked-pub
+  "Wrap a Publisher of row values into a Publisher of up-to-chunk-size vectors
+  via Reactor buffer (a shorter final vector is emitted on completion).
 
-(defn- result-flow
-  "Shared bridge skeleton for result-rows-flow and result-chunks-flow.
-
-  Consumes the Publisher<Result> one Result at a time (m/?> defaults to
-  parallelism 1) and, for each Result, consumes the per-Result Publisher built
-  by make-row-pub one value at a time. Both subscriptions are dispatched on m/blk
-  (pub/async-subscribe-pub). make-row-pub is a 1-arity fn [Result] -> Publisher
-  that selects per-row vs batched emission."
-  [^Publisher result-pub make-row-pub]
-  (m/ap
-   (let [^Result result (m/?> (m/subscribe (pub/async-subscribe-pub result-pub)))]
-     (m/?> (m/subscribe (pub/async-subscribe-pub (make-row-pub result)))))))
+  Chunking happens below the Missionary bridge so the single m/subscribe flow is
+  still consumed directly by m/reduce; a transducer (m/eduction) or m/?> over the
+  bridge would reintroduce the synchronous-publisher fork race (see ns docstring).
+  :chunk-size requires :builder-fn, so buffered values are materialized - safe to
+  batch across the bridge (unlike flyweight Rows)."
+  ^Publisher [^Publisher rows ^long chunk-size]
+  (.map (.buffer (Flux/from rows) (int chunk-size))
+        (reify Function (apply [_ batch] (vec batch)))))
 
 (defn result-rows-flow
-  "Return a Missionary discrete flow emitting transformed rows from every Result
-  produced by result-pub, flattened in order.
+  "Return a Missionary discrete flow emitting every transformed row from every
+  Result produced by result-pub, flattened in order.
 
-  Delegates row delivery to Missionary's reactive-streams bridge (m/subscribe):
-  the outer Publisher<Result> is consumed one Result at a time (m/?> defaults to
-  parallelism 1), and each Result's Publisher<Row> (from result-row-pub) is
-  consumed one row at a time. Demand-driven backpressure, cancellation, and
-  termination are handled by m/subscribe. Database round-trip batching is
-  governed independently by Statement.fetchSize (see statement/apply-opts!), so
-  one-row-at-a-time reactive demand does not change network fetch granularity.
-
-  Subscriptions are dispatched on m/blk (pub/async-subscribe-pub) to keep driver
-  callbacks off the consumer's ForkJoinPool threads and to avoid synchronous
-  re-entrancy during flow construction.
-
-  row-xf is applied inside result-row-pub's BiFunction while the Row's backing
-  ByteBuf is guaranteed live; see publisher/result-row-pub for the safety
-  argument.
+  result-pub (Publisher<Result>) is flattened to a Publisher of row values with
+  rows-pub (Reactor concatMap), then bridged to a single discrete flow with
+  m/subscribe and dispatched on m/blk (pub/async-subscribe-pub). Demand-driven
+  backpressure, cancellation, and termination are handled by m/subscribe + the
+  Reactor operator chain. Intended to be consumed by m/reduce (or m/eduction);
+  do NOT wrap it in m/?> (see ns docstring).
 
   Args:
     result-pub - Publisher<Result> from Statement.execute().
     row-xf     - 1-arity fn [Row] -> value applied to each row."
   [^Publisher result-pub row-xf]
-  (result-flow result-pub #(pub/result-row-pub % row-xf)))
+  (m/subscribe (pub/async-subscribe-pub (rows-pub result-pub row-xf))))
 
 (defn result-chunks-flow
   "Like result-rows-flow, but emits one vector of up to chunk-size transformed
   rows per value instead of one row.
 
-  Batching happens at the Reactive Streams layer via pub/buffer-pub, so the
-  downstream m/subscribe performs O(batches) transfers rather than O(rows) -
-  recovering the per-batch scheduling win. Batches are per-Result: a partial
-  final batch is emitted at each Result boundary (identical to per-stream
-  batching for the single-Result common case).
+  Batching happens below the bridge via Reactor buffer (chunked-pub), so the
+  single m/subscribe flow stays consumable directly by m/reduce and the consumer
+  performs O(batches) transfers. Batches span the whole stream (not per-Result);
+  for the single-Result common case this is identical to per-Result batching.
 
   Args:
     result-pub - Publisher<Result> from Statement.execute().
     row-xf     - 1-arity fn [Row] -> value applied to each row.
     chunk-size - positive number of rows per emitted vector."
   [^Publisher result-pub row-xf ^long chunk-size]
-  (result-flow result-pub
-               #(pub/buffer-pub (pub/result-row-pub % row-xf) chunk-size)))
+  (m/subscribe
+   (pub/async-subscribe-pub (chunked-pub (rows-pub result-pub row-xf) chunk-size))))
 
 (defn streaming-plan-flow
   "Return a Missionary discrete flow emitting transformed rows with end-to-end
-  demand-driven backpressure.
+  demand-driven backpressure and managed connection lifecycle.
 
   Connection lifecycle: when db is a ConnectionFactory, the connection is
-  acquired at flow start (via conn/acquire-connection, which subscribes
-  non-blockingly and parks on the m/blk executor, not ForkJoinPool) and
-  closed on completion/error/cancellation. When db is already a Connection,
-  the caller owns the lifecycle.
+  acquired on subscription and closed on completion/error/cancellation via
+  Reactor Flux/usingWhen (which cancels create()/execute() and runs
+  Connection.close() exactly once on any terminal signal). When db is already a
+  Connection, the caller owns the lifecycle and close() is NOT called.
 
-  Structure: an m/ap whose let-bindings (connection acquire, statement prep,
-  row flow construction) evaluate once before the first m/?> emission; the inner
-  flow is wrapped by close-conn-flow when owned, so Connection.close() runs
-  exactly once on the inner flow's terminator (the wrapper's AtomicBoolean-gated
-  terminator). Cleanup rides the terminator rather than a try/finally inside
-  m/ap, whose finally would re-run per emission.
-
-  The inner flow is result-rows-flow (one row per value) or, when opts carries
-  :chunk-size, result-chunks-flow (one vector of up to :chunk-size rows per
-  value). Both bridge the Publisher<Result> via m/subscribe. Statement.fetchSize
-  (applied from opts in stmt/prepare!) controls database fetch batching.
+  The row Publisher is built below the Missionary bridge: usingWhen acquires the
+  connection, prepares and executes the Statement, and rows-pub concatMaps each
+  Result's rows; the resulting Publisher is bridged once with m/subscribe
+  (dispatched on m/blk). The caller consumes the flow with m/reduce/m/eduction -
+  there is no m/?> over the bridge, by design (see ns docstring). Statement
+  fetchSize (applied from opts in stmt/prepare!) controls database fetch batching.
+  When opts carries :chunk-size, rows are batched into vectors below the bridge
+  via chunked-pub (Reactor buffer).
 
   Args:
     db     - ConnectionFactory or Connection (ConnectableWithOpts must be
              unwrapped by the caller via conn/resolve-connectable).
     sql    - SQL string to execute.
     params - sequential collection of bind parameters.
-    opts   - options map (see execute for supported keys); :chunk-size selects
-             chunked emission.
+    opts   - options map (see execute for supported keys).
     row-xf - 1-arity fn applied to each raw R2DBC Row to produce the emitted
              value (identity in flyweight mode)."
   [db sql params opts row-xf]
-  (let [owns-conn? (not (instance? Connection db))
-        chunk-size (:chunk-size opts)]
-    (m/ap
-     (let [^Connection conn                                                                        (m/? (conn/acquire-connection db))
-           wrapped
-           (try
-             (let [^Statement stmt (stmt/prepare! conn sql params opts)
-                   inner           (if chunk-size
-                                     (result-chunks-flow (.execute stmt) row-xf (long chunk-size))
-                                     (result-rows-flow (.execute stmt) row-xf))]
-               (if owns-conn? (close-conn-flow inner conn) inner))
-             (catch Throwable t
-               (dbg/dlog "SPF init error type=" (.getSimpleName (class t)))
-               (when owns-conn? (fire-and-forget-close! conn))
-               (throw t)))]
-       (m/?> wrapped)))))
+  (let [owns-conn?                                                       (not (instance? Connection db))
+        chunk-size                                                       (:chunk-size opts)
+        use-fn                                                           (reify Function
+                                                                           (apply [_ conn]
+                                                                             (let [rows (rows-pub (.execute ^Statement
+                                                                                                   (stmt/prepare! conn sql params opts))
+                                                                                                  row-xf)]
+                                                                               (if chunk-size (chunked-pub rows (long chunk-size)) rows))))
+        ^Publisher pub
+        (if owns-conn?
+          (Flux/usingWhen (.create ^ConnectionFactory db)
+                          use-fn
+                          (reify Function
+                            (apply [_ conn] (.close ^Connection conn))))
+          (Flux/defer (reify Supplier
+                        (get [_] (.apply use-fn db)))))]
+    (m/subscribe (pub/async-subscribe-pub pub))))
 
 (comment
   (require '[clj-r2dbc :as r2])
@@ -186,9 +151,4 @@
          (m/reduce conj [] (r2/stream conn "SELECT 1 AS n"))))
   (m/? (m/reduce (fn [_ _] (reduced :done)) nil (r2/stream db "SELECT 1 AS n")))
   (try (m/? (m/reduce conj [] (r2/stream db "NOT VALID SQL")))
-       (catch Exception e (ex-data e)))
-  (m/? (m/reduce conj
-                 []
-                 (m/ap
-                  (let [_ (m/?> ##Inf (m/seed (range 50)))]
-                    (m/? (m/reduce conj [] (r2/stream db "SELECT 1 AS n"))))))))
+       (catch Exception e (ex-data e))))

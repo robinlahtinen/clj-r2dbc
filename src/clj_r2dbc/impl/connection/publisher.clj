@@ -11,9 +11,7 @@
 
   Provides:
     result-row-pub      - Publisher<Row> for all rows in one R2DBC Result.
-    async-subscribe-pub - Publisher wrapper deferring .subscribe to m/blk.
-    buffer-pub          - Publisher wrapper batching items into size-N vectors.
-    add-demand          - saturating addition for demand accounting.
+    async-subscribe-pub - subscribeOn(m/blk) decoupling wrapper for a Publisher.
     first-pub-blocking  - blocking first-value extraction from a Publisher.
     await-void-pub!     - blocking drain-and-discard for void Publishers.
     await-future        - blocking CompletableFuture unwrap.
@@ -23,25 +21,14 @@
    [missionary.core :as m])
   (:import
    (io.r2dbc.spi Result)
-   (java.util.concurrent CompletableFuture CompletionException ExecutionException)
-   (java.util.function BiConsumer BiFunction)
-   (org.reactivestreams Publisher Subscriber Subscription)))
+   (java.util.concurrent CompletableFuture ExecutionException)
+   (java.util.function BiFunction)
+   (org.reactivestreams Publisher Subscriber Subscription)
+   (reactor.core.publisher Flux)
+   (reactor.core.scheduler Scheduler Schedulers)))
 
 (set! *warn-on-reflection* true)
 (set! *unchecked-math* :warn-on-boxed)
-
-(defn add-demand
-  "Add delta to current demand with saturation at Long/MAX_VALUE.
-
-  Used by buffer-pub to accumulate batch demand without overflow.
-
-  Args:
-    current - long, existing demand.
-    delta   - long, demand increment.
-
-  Returns a long in [current, Long/MAX_VALUE]."
-  ^long [^long current ^long delta]
-  (let [sum (+ current delta)] (if (neg? sum) Long/MAX_VALUE sum)))
 
 (defn await-future
   "Block the calling thread until fut completes and returns its result.
@@ -79,131 +66,43 @@
   ^Publisher [^Result result row-xf]
   (^[BiFunction] Result/.map result (fn [row _metadata] (row-xf row))))
 
+(def ^:private ^Scheduler blk-scheduler
+  "Reactor Scheduler backed by Missionary's blocking executor (m/blk), so the
+  decoupling boundary reuses the same unbounded pool as the rest of clj-r2dbc
+  rather than spawning a second one. Wrapping an existing Executor; disposing
+  this Scheduler does not shut m/blk down."
+  (Schedulers/fromExecutor m/blk))
+
 (defn async-subscribe-pub
-  "Wrap pub so that .subscribe is dispatched on the Missionary blocking
-  executor (m/blk) rather than the caller's thread.
+  "Wrap pub with a Reactor subscribeOn(m/blk) boundary so subscription AND all
+  emissions are dispatched on the Missionary blocking executor rather than the
+  consumer's thread.
 
-  This interposes an async boundary on subscription so a synchronous publisher
-  (e.g. Reactor scalar fusion, or H2 in-memory emitting during subscribe)
-  cannot invoke a downstream Subscriber callback re-entrantly while a Missionary
-  flow is still being constructed. Keeps driver-side subscribe work off the
-  ForkJoinPool consumer threads.
+  Why subscribeOn, and why it is required for correctness (not just thread
+  placement): a *synchronous* Publisher (H2 in-memory, Reactor scalar fusion)
+  emits onNext re-entrantly from inside the consumer's request(n) call. When that
+  consumer is Missionary's m/subscribe being forked by m/?> (Ambiguous), the
+  re-entrant signal races the fork: it either throws ClassCastException mid-fork
+  (notifier fires before the iterator is assigned) or, under concurrent load,
+  drops a wakeup and parks the flow forever. subscribeOn moves the subscription
+  and the whole request->onNext cascade onto a blk thread, so the cascade no
+  longer re-enters the consumer's request frame. An async driver (Netty-based
+  Postgres/MariaDB) never emits during request and is unaffected; this boundary
+  exists for the synchronous case but is applied uniformly.
 
-  If pub's .subscribe throws synchronously on the m/blk thread, the error is
-  forwarded to the Subscriber's onError; otherwise it would be swallowed by the
-  discarded CompletableFuture, leaving a downstream m/subscribe parked forever.
+  subscribeOn is deliberately chosen over publishOn: publishOn inserts a prefetch
+  queue (default 256) that both defeats the request(1)/fetchSize-1 backpressure
+  this design maintains and buffers Rows across the thread boundary - unsafe in
+  flyweight mode where the emitted value is a live-ByteBuf-backed Row.
+  subscribeOn relays each request(1) verbatim and buffers nothing (verified: max
+  upstream request stays 1).
 
   Args:
-    pub - Publisher to subscribe to asynchronously.
+    pub - Publisher to subscribe to / emit from on m/blk.
 
-  Returns a Publisher that defers pub's subscription to m/blk."
+  Returns a Publisher decoupled from the consumer's thread via subscribeOn."
   ^Publisher [^Publisher pub]
-  (reify
-    Publisher
-    (subscribe [_ sub]
-      (.whenComplete
-       (CompletableFuture/runAsync
-        ^Runnable (fn [] (.subscribe pub ^Subscriber sub))
-        m/blk)
-       ^BiConsumer
-       (reify BiConsumer
-         (accept [_ _ ex]
-           (when ex
-             (.onError ^Subscriber sub
-                       (if (instance? CompletionException ex)
-                         (or (.getCause ^Throwable ex) ex)
-                         ex))))))
-      nil)))
-
-(defn buffer-pub
-  "Wrap upstream so emitted items are batched into vectors of up to chunk-size.
-
-  Returns a Publisher<clojure.lang.IPersistentVector> that, on each downstream
-  request, pulls chunk-size items from upstream and emits them as one vector;
-  the final vector may be shorter. This moves batching to the Reactive Streams
-  layer so a downstream m/subscribe performs O(batches) transfers rather than
-  O(rows), restoring the per-batch scheduling win without a hand-rolled flow.
-
-  Demand-driven and RS-compliant for a conformant upstream (delivers at most the
-  requested count): each downstream request(d) collects d batches, requesting
-  chunk-size upstream per batch. onComplete flushes any partial final batch.
-  Errors and cancellation propagate to/from upstream. Terminal signals fire once:
-  the lock-guarded done flag also elects the single thread that may signal
-  downstream termination, so no separate atomic is needed. All buf access is
-  serialized by the state monitor, which lets a transient vector accumulate
-  batches without the O(chunk-size) copy a mutable list + vec would cost."
-  ^Publisher [^Publisher upstream ^long chunk-size]
-  (reify
-    Publisher
-    (subscribe [_ downstream]
-      (let [state                                                                   (Object.)
-            buf                                                                     (volatile! (transient []))
-            up-sub                                                                  (volatile! nil)
-            demand                                                                  (long-array 1)
-            collecting                                                              (volatile! false)
-            done                                                                    (volatile! false)
-            cancelled                                                               (volatile! false)
-            start-collect!
-            (fn []
-              (let [^Subscription s
-                    (locking state
-                      (when (and (not @collecting) (not @done) (not @cancelled)
-                                 (pos? (aget demand 0)) @up-sub)
-                        (vreset! collecting true)
-                        @up-sub))]
-                (when s (.request s chunk-size))))
-            up-subscriber
-            (reify
-              Subscriber
-              (onSubscribe [_ s]
-                (let [cancel? (locking state
-                                (if @cancelled
-                                  true
-                                  (do (vreset! up-sub s) false)))]
-                  (if cancel? (.cancel ^Subscription s) (start-collect!))))
-              (onNext [_ x]
-                (let [batch (locking state
-                              (when-not (or @cancelled @done)
-                                (vswap! buf conj! x)
-                                (when (>= (count @buf) chunk-size)
-                                  (let [v (persistent! @buf)]
-                                    (vreset! buf (transient []))
-                                    (aset demand 0 (unchecked-dec (aget demand 0)))
-                                    (vreset! collecting false)
-                                    v))))]
-                  (when batch
-                    (.onNext ^Subscriber downstream batch)
-                    (start-collect!))))
-              (onError [_ t]
-                (let [won? (locking state
-                             (when-not @done (vreset! done true) true))]
-                  (when won?
-                    (.onError ^Subscriber downstream t))))
-              (onComplete [_]
-                (let [[won? tail] (locking state
-                                    (if @done
-                                      [false nil]
-                                      (do (vreset! done true)
-                                          [true (when (pos? (count @buf))
-                                                  (persistent! @buf))])))]
-                  (when won?
-                    (when tail (.onNext ^Subscriber downstream tail))
-                    (.onComplete ^Subscriber downstream)))))]
-        (.onSubscribe
-         ^Subscriber downstream
-         (reify
-           Subscription
-           (request [_ d]
-             (when (pos? (long d))
-               (locking state
-                 (aset demand 0 (add-demand (aget demand 0) (long d))))
-               (start-collect!)))
-           (cancel [_]
-             (let [^Subscription s (locking state
-                                     (vreset! cancelled true)
-                                     @up-sub)]
-               (when s (.cancel s))))))
-        (.subscribe upstream up-subscriber)))))
+  (.subscribeOn (Flux/from pub) blk-scheduler))
 
 (defn first-pub-blocking
   "Subscribe to pub, request one item, and return it synchronously.
