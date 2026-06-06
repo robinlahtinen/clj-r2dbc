@@ -152,9 +152,17 @@
 
 (defn docs
   "Generate Codox documentation using the project classpath.
-  Pass the version derived from opts so docs always reflect the actual build version."
+
+  For release builds, override the version so docs reflect the release version.
+  For snapshot builds (the default, e.g. under `verify`), rely on the :docs
+  alias's default :version: passing a quoted EDN string as a process arg is
+  mangled by Windows process-argument quoting (clojure -X then sees a bare,
+  unreadable 0.1.0-SNAPSHOT), and the alias default already matches the snapshot
+  version."
   [opts]
-  (run-command {:command-args  ["clojure" "-X:docs" ":version" (pr-str (get-version opts))]
+  (run-command {:command-args  (cond-> ["clojure" "-X:docs"]
+                                 (:release opts)
+                                 (conj ":version" (pr-str (get-version opts))))
                 :error-message "Docs generation failed"})
   opts)
 
