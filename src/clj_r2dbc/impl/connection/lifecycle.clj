@@ -9,8 +9,10 @@
   When db is already a Connection: the caller owns the lifecycle;
   Connection.close() is NOT called.
 
-  This namespace owns stream connection lifecycle transitions.
-  Flow state machines (r2dbc-row-flow, r2dbc-chunk-flow) live in impl/execute/stream.
+  This namespace owns stream connection lifecycle transitions and the
+  Publisher<Result> -> row flow bridge (result-rows-flow), built on Missionary's
+  reactive-streams adapter (m/subscribe). Chunking and flyweight transforms are
+  applied by the caller (impl/execute/stream) via m/eduction.
 
   This namespace is an implementation detail; do not use from application code."
   (:require
@@ -20,7 +22,7 @@
    [clj-r2dbc.impl.sql.statement :as stmt]
    [missionary.core :as m])
   (:import
-   (io.r2dbc.spi Connection Statement)
+   (io.r2dbc.spi Connection Result Statement)
    (org.reactivestreams Publisher Subscriber Subscription)))
 
 (set! *warn-on-reflection* true)
@@ -70,6 +72,56 @@
                   (onComplete [_])))
     (catch Throwable _ nil)))
 
+(defn result-rows-flow
+  "Return a Missionary discrete flow emitting transformed rows from every Result
+  produced by result-pub, flattened in order.
+
+  Delegates row delivery to Missionary's reactive-streams bridge (m/subscribe):
+  the outer Publisher<Result> is consumed one Result at a time (m/?> defaults to
+  parallelism 1), and each Result's Publisher<Row> (from result-row-pub) is
+  consumed one row at a time. Demand-driven backpressure, cancellation, and
+  termination are handled by m/subscribe. Database round-trip batching is
+  governed independently by Statement.fetchSize (see statement/apply-opts!), so
+  one-row-at-a-time reactive demand does not change network fetch granularity.
+
+  Subscriptions are dispatched on m/blk (pub/async-subscribe-pub) to keep driver
+  callbacks off the consumer's ForkJoinPool threads and to avoid synchronous
+  re-entrancy during flow construction.
+
+  row-xf is applied inside result-row-pub's BiFunction while the Row's backing
+  ByteBuf is guaranteed live; see publisher/result-row-pub for the safety
+  argument.
+
+  Args:
+    result-pub - Publisher<Result> from Statement.execute().
+    row-xf     - 1-arity fn [Row] -> value applied to each row."
+  [^Publisher result-pub row-xf]
+  (m/ap
+   (let [^Result result (m/?> (m/subscribe (pub/async-subscribe-pub result-pub)))]
+     (m/?> (m/subscribe (pub/async-subscribe-pub
+                         (pub/result-row-pub result row-xf)))))))
+
+(defn result-chunks-flow
+  "Like result-rows-flow, but emits one vector of up to chunk-size transformed
+  rows per value instead of one row.
+
+  Batching happens at the Reactive Streams layer via pub/buffer-pub, so the
+  downstream m/subscribe performs O(batches) transfers rather than O(rows) -
+  recovering the per-batch scheduling win. Batches are per-Result: a partial
+  final batch is emitted at each Result boundary (identical to per-stream
+  batching for the single-Result common case).
+
+  Args:
+    result-pub - Publisher<Result> from Statement.execute().
+    row-xf     - 1-arity fn [Row] -> value applied to each row.
+    chunk-size - positive number of rows per emitted vector."
+  [^Publisher result-pub row-xf ^long chunk-size]
+  (m/ap
+   (let [^Result result (m/?> (m/subscribe (pub/async-subscribe-pub result-pub)))]
+     (m/?> (m/subscribe (pub/async-subscribe-pub
+                         (pub/buffer-pub (pub/result-row-pub result row-xf)
+                                         chunk-size)))))))
+
 (defn streaming-plan-flow
   "Return a Missionary discrete flow emitting transformed rows with end-to-end
   demand-driven backpressure.
@@ -81,49 +133,42 @@
   the caller owns the lifecycle.
 
   Structure: an m/ap whose let-bindings (connection acquire, statement prep,
-  row-pub construction, inner row-flow construction) evaluate once before the
-  first m/?> emission; the inner row-flow is wrapped by close-conn-flow when
-  owned, so close runs exactly once via the inner flow's signal-terminator!
-  AtomicBoolean.
+  row flow construction) evaluate once before the first m/?> emission; the inner
+  flow is wrapped by close-conn-flow when owned, so Connection.close() runs
+  exactly once on the inner flow's terminator (the wrapper's AtomicBoolean-gated
+  terminator). Cleanup rides the terminator rather than a try/finally inside
+  m/ap, whose finally would re-run per emission.
 
-  row-flow-fn selects the per-row emission strategy:
-    r2dbc-row-flow   - one row per deref() (default when not supplied).
-    r2dbc-chunk-flow - one ArrayList per fetch-size batch per deref().
-
-  Backpressure chain:
-    consumer m/reduce -> m/?> wrapped-flow -> row-flow.deref()
-      -> Subscription.request(fetch-size) -> R2DBC driver -> database cursor
+  The inner flow is result-rows-flow (one row per value) or, when opts carries
+  :chunk-size, result-chunks-flow (one vector of up to :chunk-size rows per
+  value). Both bridge the Publisher<Result> via m/subscribe. Statement.fetchSize
+  (applied from opts in stmt/prepare!) controls database fetch batching.
 
   Args:
-    db          - ConnectionFactory or Connection (ConnectableWithOpts must be
-                  unwrapped by the caller via conn/resolve-connectable).
-    sql         - SQL string to execute.
-    params      - sequential collection of bind parameters.
-    opts        - options map (see execute for supported keys).
-    row-xf      - 1-arity fn applied to each raw R2DBC Row before buffering.
-    row-flow-fn - fn [Publisher fetch-size xf] -> Missionary flow constructor."
-  [db sql params opts row-xf row-flow-fn]
-  (let [fetch-size (pub/resolve-fetch-size opts)
-        owns-conn? (not (instance? Connection db))]
+    db     - ConnectionFactory or Connection (ConnectableWithOpts must be
+             unwrapped by the caller via conn/resolve-connectable).
+    sql    - SQL string to execute.
+    params - sequential collection of bind parameters.
+    opts   - options map (see execute for supported keys); :chunk-size selects
+             chunked emission.
+    row-xf - 1-arity fn applied to each raw R2DBC Row to produce the emitted
+             value (identity in flyweight mode)."
+  [db sql params opts row-xf]
+  (let [owns-conn? (not (instance? Connection db))
+        chunk-size (:chunk-size opts)]
     (m/ap
      (let [^Connection conn                                                                        (m/? (conn/acquire-connection db))
-           _                                                                                       (dbg/dlog "SPF conn acquired id="
-                                                                                                             (Integer/toHexString (System/identityHashCode conn))
-                                                                                                             " owns-conn?=" owns-conn?)
            wrapped
            (try
-             (let [^Statement stmt                      (stmt/prepare! conn sql params opts)
-                   ^Publisher row-pub
-                   (pub/result-rows-pub (.execute stmt)
-                                        (volatile! nil)
-                                        row-xf)
-                   inner                                (row-flow-fn row-pub fetch-size identity)]
+             (let [^Statement stmt (stmt/prepare! conn sql params opts)
+                   inner           (if chunk-size
+                                     (result-chunks-flow (.execute stmt) row-xf (long chunk-size))
+                                     (result-rows-flow (.execute stmt) row-xf))]
                (if owns-conn? (close-conn-flow inner conn) inner))
              (catch Throwable t
                (dbg/dlog "SPF init error type=" (.getSimpleName (class t)))
                (when owns-conn? (fire-and-forget-close! conn))
                (throw t)))]
-       (dbg/dlog "SPF entering m/?> wrapped flow")
        (m/?> wrapped)))))
 
 (comment

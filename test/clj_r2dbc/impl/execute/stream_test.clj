@@ -12,11 +12,12 @@
   Setup: test_table created once before all tests via use-fixtures :once."
   (:require
    [clj-r2dbc.impl.connection :as conn]
-   [clj-r2dbc.impl.connection.publisher :as pub]
+   [clj-r2dbc.impl.connection.lifecycle :as life]
    [clj-r2dbc.impl.datafy :as datafy-impl]
    [clj-r2dbc.impl.execute.stream :as stream]
    [clj-r2dbc.impl.sql.cursor :as cursor]
    [clj-r2dbc.impl.sql.row :as row]
+   [clj-r2dbc.impl.sql.statement :as stmt]
    [clj-r2dbc.impl.util :as util]
    [clj-r2dbc.test-util.db :as db]
    [clj-r2dbc.test-util.mock :as mock]
@@ -24,8 +25,7 @@
    [missionary.core :as m])
   (:import
    (clj_r2dbc.impl.sql.cursor RowCursor)
-   (clojure.lang ExceptionInfo)
-   (io.r2dbc.spi Connection Row)))
+   (io.r2dbc.spi Connection Row Statement)))
 
 (set! *warn-on-reflection* true)
 
@@ -246,148 +246,77 @@
              (is (some? (conn/connection-metadata* conn))))
            (finally (close-conn! conn))))))
 
-(deftest ^:pattern-18 row-flow-demand-bounded-test
-  (testing
-   "r2dbc-row-flow requests fetch-size batches instead of unbounded demand"
-    (let [{:keys [publisher requests completed?]}                             (mock/tracking-publisher
-                                                                               {:items (range 20)})
-          values
-          (db/run-task!
-           (m/reduce conj [] (#'stream/r2dbc-row-flow publisher 4 identity)))]
-      (is (= (vec (range 20)) values))
-      (is (every? #(= 4 %) @requests))
-      (is (<= 20 (reduce + @requests) 24))
-      (is (true? @completed?)))))
+;; result-rows-flow / result-chunks-flow are exercised against a real H2 database:
+;; the r2dbc-spi-test MockResult.map publisher ignores Reactive Streams demand
+;; (it floods all rows on the first request), which Missionary's m/subscribe
+;; bridge - a single-slot, strictly demand-driven consumer - cannot represent.
+;; Real R2DBC drivers honor request(n), so these use real Results.
 
-(deftest row-flow-cancellation-propagates-test
-  (testing
-   "early termination cancels the upstream Subscription without extra demand"
-    (let [{:keys [publisher requests cancelled?]} (mock/tracking-publisher
-                                                   {:items (range 1000)})
-          seen                                    (db/run-task! (m/reduce
-                                                                 (fn [acc _]
-                                                                   (let [next (inc acc)]
-                                                                     (if (= 10 next) (reduced next) next)))
-                                                                 0
-                                                                 (#'stream/r2dbc-row-flow publisher 32 identity)))]
-      (is (= 10 seen))
-      (is (= [32] @requests))
-      (is (true? @cancelled?)))))
+(deftest result-rows-flow-multi-result-order-test
+  (testing "result-rows-flow flattens rows from multiple Results in order"
+    (let [cf   (get-factory)
+          conn (db/run-task! (conn/acquire-connection cf))]
+      (try
+        (let [^Statement s (stmt/prepare!
+                            conn
+                            (str "SELECT id FROM test_table WHERE id <= 2 ORDER BY id;"
+                                 " SELECT id FROM test_table WHERE id = 3")
+                            []
+                            {:fetch-size 1})
+              ids          (db/run-task!
+                            (m/reduce conj []
+                                      (life/result-rows-flow
+                                       (.execute s)
+                                       (fn [^Row r] (.get r 0 Integer)))))]
+          (is (= [1 2 3] ids)))
+        (finally (close-conn! conn))))))
 
-(deftest row-flow-error-after-buffer-drain-test
-  (testing "buffered rows are emitted before the upstream error is thrown"
-    (let [seen                         (atom [])
-          boom                         (ex-info "boom" {:phase :row-flow})
-          {:keys [publisher requests]} (mock/tracking-publisher {:items [1 2 3]
-                                                                 :error boom})]
-      (is (thrown-with-msg? ExceptionInfo
-                            #"boom"
-                            (db/run-task!
-                             (m/reduce
-                              (fn [acc v] (swap! seen conj v) acc)
-                              nil
-                              (#'stream/r2dbc-row-flow publisher 2 identity)))))
-      (is (= [1 2 3] @seen))
-      (is (= [2 2] @requests)))))
+(deftest result-rows-flow-cancellation-test
+  (testing "early termination stops result-rows-flow after the reduced value"
+    (let [cf   (get-factory)
+          conn (db/run-task! (conn/acquire-connection cf))]
+      (try
+        (let [^Statement s (stmt/prepare! conn "SELECT id FROM test_table ORDER BY id"
+                                          [] {:fetch-size 1})
+              seen         (db/run-task!
+                            (m/reduce (fn [acc _]
+                                        (let [n (inc acc)] (if (= 2 n) (reduced n) n)))
+                                      0
+                                      (life/result-rows-flow
+                                       (.execute s)
+                                       (fn [^Row r] (.get r 0 Integer)))))]
+          (is (= 2 seen)))
+        (finally (close-conn! conn))))))
 
-(deftest row-flow-fetch-size-one-async-test
-  (testing "r2dbc-row-flow with fetch-size=1 and async delivery emits all items"
-    (let [{:keys [publisher requests]}                                        (mock/tracking-publisher {:items (range
-                                                                                                                5)})
-          values
-          (db/run-task!
-           (m/reduce conj [] (#'stream/r2dbc-row-flow publisher 1 identity)))]
-      (is (= [0 1 2 3 4] values))
-      (is (every? #(= 1 %) @requests)))))
+(deftest result-rows-flow-error-test
+  (testing "result-rows-flow propagates an upstream error"
+    (let [cf   (get-factory)
+          conn (db/run-task! (conn/acquire-connection cf))]
+      (try
+        (is (thrown? Throwable
+                     (db/run-task!
+                      (m/reduce conj []
+                                (life/result-rows-flow
+                                 (.execute (stmt/prepare! conn "SELECT nope FROM nope" [] {}))
+                                 identity)))))
+        (finally (close-conn! conn))))))
 
-(deftest ^:pattern-18 result-rows-demand-bounded-test
-  (testing
-   "result-rows-pub requests one Result at a time while rows stream in fetch-size batches"
-    (let [row->map*                               (fn [^Row r] ((row/make-row-fn) r (.getMetadata r)))
-          result-1                                (mock/mock-result
-                                                   {:rows [(mock/mock-row (array-map "id" 1 "name" "Alice"))
-                                                           (mock/mock-row (array-map "id" 2 "name" "Bob"))
-                                                           (mock/mock-row (array-map "id" 3 "name" "Carol"))]})
-          result-2                                (mock/mock-result
-                                                   {:rows [(mock/mock-row (array-map "id" 4 "name" "Dan"))
-                                                           (mock/mock-row (array-map "id" 5 "name" "Eve"))
-                                                           (mock/mock-row (array-map "id" 6 "name" "Frank"))]})
-          {:keys [publisher requests completed?]} (mock/tracking-publisher
-                                                   {:items [result-1 result-2]})
-          values                                  (db/run-task!
-                                                   (m/reduce
-                                                    conj
-                                                    []
-                                                    (#'stream/r2dbc-row-flow
-                                                     (#'pub/result-rows-pub publisher (volatile! nil) row->map*)
-                                                     2
-                                                     identity)))]
-      (is (= [{:id 1, :name "Alice"} {:id 2, :name "Bob"} {:id 3, :name "Carol"}
-              {:id 4, :name "Dan"} {:id 5, :name "Eve"} {:id 6, :name "Frank"}]
-             values))
-      (is (= [1 1] @requests))
-      (is (true? @completed?)))))
-
-(deftest result-rows-cancellation-propagates-test
-  (testing
-   "early termination cancels the outer Result publisher without unbounded Result demand"
-    (let [result-1                                (mock/mock-result {:rows [(mock/mock-row (array-map "id" 1))
-                                                                            (mock/mock-row (array-map "id" 2))
-                                                                            (mock/mock-row (array-map "id" 3))
-                                                                            (mock/mock-row (array-map "id"
-                                                                                                      4))]})
-          result-2                                (mock/mock-result {:rows [(mock/mock-row (array-map "id" 5))
-                                                                            (mock/mock-row (array-map "id"
-                                                                                                      6))]})
-          {:keys [publisher requests cancelled?]} (mock/tracking-publisher
-                                                   {:items [result-1 result-2]})
-          seen                                    (db/run-task!
-                                                   (m/reduce
-                                                    (fn [acc _]
-                                                      (let [next (inc acc)] (if (= 2 next) (reduced next) next)))
-                                                    0
-                                                    (#'stream/r2dbc-row-flow
-                                                     (#'pub/result-rows-pub publisher (volatile! nil) identity)
-                                                     2
-                                                     identity)))]
-      (is (= 2 seen))
-      (is (= [1] @requests))
-      (is (true? @cancelled?)))))
-
-(deftest ^:pattern-13 result-rows-cancellation-during-second-result-test
-  (testing
-   "cancellation after first Result prevents delivery of subsequent Results"
-    (let [result-1                       (mock/mock-result {:rows [(mock/mock-row (array-map "id" 1))
-                                                                   (mock/mock-row (array-map "id" 2))
-                                                                   (mock/mock-row (array-map "id" 3))
-                                                                   (mock/mock-row (array-map "id" 4))
-                                                                   (mock/mock-row (array-map "id"
-                                                                                             5))]})
-          result-2                       (mock/mock-result {:rows [(mock/mock-row (array-map "id" 6))
-                                                                   (mock/mock-row (array-map "id" 7))
-                                                                   (mock/mock-row (array-map "id" 8))
-                                                                   (mock/mock-row (array-map "id" 9))
-                                                                   (mock/mock-row (array-map "id"
-                                                                                             10))]})
-          result-3                       (mock/mock-result {:rows [(mock/mock-row (array-map "id" 11))
-                                                                   (mock/mock-row (array-map "id" 12))
-                                                                   (mock/mock-row (array-map "id" 13))
-                                                                   (mock/mock-row (array-map "id" 14))
-                                                                   (mock/mock-row (array-map "id"
-                                                                                             15))]})
-          {:keys [publisher cancelled?]} (mock/tracking-publisher
-                                          {:items [result-1 result-2 result-3]})
-          seen                           (db/run-task!
-                                          (m/reduce
-                                           (fn [acc _]
-                                             (let [next (inc acc)] (if (= 3 next) (reduced next) next)))
-                                           0
-                                           (#'stream/r2dbc-row-flow
-                                            (#'pub/result-rows-pub publisher (volatile! nil) identity)
-                                            5
-                                            identity)))]
-      (is (= 3 seen))
-      (is (true? @cancelled?)))))
+(deftest result-chunks-flow-batches-test
+  (testing "result-chunks-flow emits size-N vectors with a short final batch"
+    (let [cf   (get-factory)
+          conn (db/run-task! (conn/acquire-connection cf))]
+      (try
+        (let [^Statement s (stmt/prepare! conn "SELECT id FROM test_table ORDER BY id"
+                                          [] {:fetch-size 2})
+              chunks       (db/run-task!
+                            (m/reduce conj []
+                                      (life/result-chunks-flow
+                                       (.execute s)
+                                       (fn [^Row r] (.get r 0 Integer))
+                                       2)))]
+          (is (= [[1 2] [3]] chunks))
+          (is (every? vector? chunks)))
+        (finally (close-conn! conn))))))
 
 (deftest ^:pattern-17 plan-cancellation-closes-connection-test
   (testing "plan* closes the acquired connection when cancelled mid-stream"
@@ -421,24 +350,19 @@
       (is (= 1 @close-count)))))
 
 (deftest plan-multiple-results-order-test                   ;; test 13
-  (testing "plan* streams rows from multiple Result objects in order"
-    (let [result-1 (mock/mock-result
-                    {:rows [(mock/mock-row (array-map "id" 1 "name" "Alice"))
-                            (mock/mock-row (array-map "id" 2 "name" "Bob"))]})
-          result-2 (mock/mock-result
-                    {:rows [(mock/mock-row (array-map "id" 3 "name" "Carol"))
-                            (mock/mock-row (array-map "id" 4 "name" "Dan"))]})
-          stmt     (mock/mock-statement [result-1 result-2])
-          conn     (mock/mock-connection {:statement stmt})
-          rows     (db/run-task! (m/reduce conj
-                                           []
-                                           (stream/stream*
-                                            conn
-                                            "SELECT id, name FROM ignored"
-                                            []
-                                            {:builder-fn (row/make-row-fn)})))]
-      (is (= [{:id 1, :name "Alice"} {:id 2, :name "Bob"} {:id 3, :name "Carol"}
-              {:id 4, :name "Dan"}]
+  (testing "stream* streams rows from multiple Result objects in order"
+    ;; Real H2 returns one Result per statement in a multi-statement execute;
+    ;; result-rows-flow flattens them in order.
+    (let [cf   (get-factory)
+          rows (db/run-task!
+                (m/reduce conj []
+                          (stream/stream*
+                           cf
+                           (str "SELECT id, name FROM test_table WHERE id <= 2 ORDER BY id;"
+                                " SELECT id, name FROM test_table WHERE id = 3")
+                           []
+                           {:builder-fn (row/make-row-fn)})))]
+      (is (= [{:id 1, :name "Alice"} {:id 2, :name "Bob"} {:id 3, :name "Carol"}]
              rows)))))
 
 (deftest streaming-plan-flow-concurrent-stress-test
@@ -511,3 +435,53 @@
                                             :fetch-size 1}))
                                          (m/sp nil)))))))]
         (is (= 20 (count results)) (str "iteration " iter))))))
+
+(deftest streaming-plan-flow-concurrent-chunk-stress-test
+  (testing
+   "no hang, loss, or duplication under concurrent chunked streaming (buffer-pub)"
+    ;; Exercises buffer-pub - a concurrent Reactive Streams state machine - under
+    ;; load: 20 independent buffer-pubs each racing upstream onNext (m/blk) against
+    ;; downstream request/cancel. Sums chunk counts per stream; expects 3 rows each.
+    (dotimes [iter concurrent-iterations]
+      (let [results (db/run-task-timeout!
+                     30000
+                     (m/reduce conj
+                               []
+                               (m/ap (let [_i (m/?> 20 (m/seed (range 100)))]
+                                       (m/?
+                                        (m/reduce
+                                         (fn [acc chunk] (+ (long acc) (count chunk)))
+                                         0
+                                         (stream/stream*
+                                          (get-factory)
+                                          "SELECT id FROM test_table ORDER BY id"
+                                          []
+                                          {:builder-fn (row/make-row-fn)
+                                           :chunk-size 2})))))))]
+        (is (= 100 (count results)) (str "iteration " iter))
+        (is (every? #(= 3 %) results) (str "iteration " iter))))))
+
+(deftest streaming-plan-flow-concurrent-chunk-cancel-test
+  (testing
+   "no hang when a chunked stream is cancelled mid-stream under concurrent load"
+    ;; Exercises buffer-pub's cancel path (downstream cancel -> upstream cancel)
+    ;; under load: each of 20 concurrent flows reduces with `reduced` after the
+    ;; first chunk, cancelling the flow while buffer-pub may still be collecting.
+    (dotimes [iter concurrent-iterations]
+      (let [results (db/run-task-timeout!
+                     30000
+                     (m/reduce conj
+                               []
+                               (m/ap (let [_i (m/?> 20 (m/seed (range 100)))]
+                                       (m/?
+                                        (m/reduce
+                                         (fn [_ chunk] (reduced (count chunk)))
+                                         0
+                                         (stream/stream*
+                                          (get-factory)
+                                          "SELECT id FROM test_table ORDER BY id"
+                                          []
+                                          {:builder-fn (row/make-row-fn)
+                                           :chunk-size 2})))))))]
+        (is (= 100 (count results)) (str "iteration " iter))
+        (is (every? #(= 2 %) results) (str "iteration " iter))))))

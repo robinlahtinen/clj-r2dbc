@@ -4,58 +4,38 @@
 (ns clj-r2dbc.impl.connection.publisher
   "Reactive Streams publisher bridges for clj-r2dbc.
 
-  Pure org.reactivestreams interop - zero Missionary dependency in this namespace.
-
-  Three utility categories:
-    Fetch-size resolution: resolve-fetch-size extracts a safe positive long
-    from caller opts.
-    Demand arithmetic: add-demand performs saturating addition to accumulate
-    backpressure demand without overflow.
-    Future bridging: await-future, first-pub-blocking, and await-void-pub!
-    block the calling thread to synchronize with Reactive Streams callbacks
-    where Missionary parking is unavailable.
+  org.reactivestreams interop for clj-r2dbc. Row delivery to Missionary flows is
+  handled by Missionary's reactive-streams adapter (m/subscribe, see
+  connection/lifecycle); this namespace provides the Publisher constructors and
+  the blocking/async bridges used around it.
 
   Provides:
-    result-row-pub     - Publisher<Row> for all rows in one R2DBC Result.
-    result-rows-pub    - Publisher<Row> streaming rows from multiple Results sequentially.
-    first-pub-blocking - blocking first-value extraction from a Publisher.
-    await-void-pub!    - blocking drain-and-discard for void Publishers.
-    await-future       - blocking CompletableFuture unwrap.
-    request-async!     - async Subscription.request call via m/blk.
-    resolve-fetch-size - safe fetch-size extraction from opts.
-    add-demand         - saturating addition for demand accounting.
+    result-row-pub      - Publisher<Row> for all rows in one R2DBC Result.
+    async-subscribe-pub - Publisher wrapper deferring .subscribe to m/blk.
+    buffer-pub          - Publisher wrapper batching items into size-N vectors.
+    add-demand          - saturating addition for demand accounting.
+    first-pub-blocking  - blocking first-value extraction from a Publisher.
+    await-void-pub!     - blocking drain-and-discard for void Publishers.
+    await-future        - blocking CompletableFuture unwrap.
 
   This namespace is an implementation detail; do not use from application code."
   (:require
-   [clj-r2dbc.debug-log :as dbg]
    [missionary.core :as m])
   (:import
    (io.r2dbc.spi Result)
-   (java.util.concurrent CompletableFuture ExecutionException)
+   (java.util ArrayList)
+   (java.util.concurrent CompletableFuture CompletionException ExecutionException)
    (java.util.concurrent.atomic AtomicBoolean)
-   (java.util.function BiFunction)
+   (java.util.function BiConsumer BiFunction)
    (org.reactivestreams Publisher Subscriber Subscription)))
 
 (set! *warn-on-reflection* true)
 (set! *unchecked-math* :warn-on-boxed)
 
-(defn resolve-fetch-size
-  "Resolve the effective fetch size from opts.
-
-  Returns the :fetch-size value when present and valid; otherwise returns
-  the default of 128. Applies the value as a primitive long.
-
-  Args:
-    opts - map, may contain :fetch-size.
-
-  Returns a positive long."
-  ^long [opts]
-  (let [raw (long (:fetch-size opts 128))] (if (pos? raw) raw 128)))
-
 (defn add-demand
   "Add delta to current demand with saturation at Long/MAX_VALUE.
 
-  Used to accumulate backpressure demand counts without overflow.
+  Used by buffer-pub to accumulate batch demand without overflow.
 
   Args:
     current - long, existing demand.
@@ -101,163 +81,129 @@
   ^Publisher [^Result result row-xf]
   (^[BiFunction] Result/.map result (fn [row _metadata] (row-xf row))))
 
-(defn result-rows-pub
-  "Return a Publisher<T> that streams transformed rows from result-pub sequentially.
+(defn async-subscribe-pub
+  "Wrap pub so that .subscribe is dispatched on the Missionary blocking
+  executor (m/blk) rather than the caller's thread.
 
-  At most one Result is requested at a time. Downstream demand is forwarded to
-  the active Result.map publisher, so row demand remains bounded by the row-flow
-  fetch-size rather than collapsing to Long/MAX_VALUE at the Result boundary.
+  This interposes an async boundary on subscription so a synchronous publisher
+  (e.g. Reactor scalar fusion, or H2 in-memory emitting during subscribe)
+  cannot invoke a downstream Subscriber callback re-entrantly while a Missionary
+  flow is still being constructed. Keeps driver-side subscribe work off the
+  ForkJoinPool consumer threads.
 
-  row-xf is forwarded to result-row-pub and applied inside BiFunction.apply()
-  while the Row's ByteBuf is guaranteed to be live. See result-row-pub for the
-  detailed safety argument.
+  If pub's .subscribe throws synchronously on the m/blk thread, the error is
+  forwarded to the Subscriber's onError; otherwise it would be swallowed by the
+  discarded CompletableFuture, leaving a downstream m/subscribe parked forever.
 
   Args:
-    result-pub     - Publisher<Result> to consume.
-    result-sub-ref - volatile holding the outer Subscription for cancellation.
-    row-xf         - 1-arity fn [Row] -> T applied to each row."
-  ^Publisher [^Publisher result-pub result-sub-ref row-xf]
+    pub - Publisher to subscribe to asynchronously.
+
+  Returns a Publisher that defers pub's subscription to m/blk."
+  ^Publisher [^Publisher pub]
+  (reify
+    Publisher
+    (subscribe [_ sub]
+      (.whenComplete
+       (CompletableFuture/runAsync
+        ^Runnable (fn [] (.subscribe pub ^Subscriber sub))
+        m/blk)
+       ^BiConsumer
+       (reify BiConsumer
+         (accept [_ _ ex]
+           (when ex
+             (.onError ^Subscriber sub
+                       (if (instance? CompletionException ex)
+                         (or (.getCause ^Throwable ex) ex)
+                         ex))))))
+      nil)))
+
+(defn buffer-pub
+  "Wrap upstream so emitted items are batched into vectors of up to chunk-size.
+
+  Returns a Publisher<clojure.lang.IPersistentVector> that, on each downstream
+  request, pulls chunk-size items from upstream and emits them as one vector;
+  the final vector may be shorter. This moves batching to the Reactive Streams
+  layer so a downstream m/subscribe performs O(batches) transfers rather than
+  O(rows), restoring the per-batch scheduling win without a hand-rolled flow.
+
+  Demand-driven and RS-compliant for a conformant upstream (delivers at most the
+  requested count): each downstream request(d) collects d batches, requesting
+  chunk-size upstream per batch. onComplete flushes any partial final batch.
+  Errors and cancellation propagate to/from upstream. Terminal signals fire once.
+
+  Args:
+    upstream   - Publisher<T> to batch.
+    chunk-size - positive number of items per emitted vector."
+  ^Publisher [^Publisher upstream ^long chunk-size]
   (reify
     Publisher
     (subscribe [_ downstream]
-      (let [state                                                             (Object.)
-            pub-id                                                            (str "PUB" (Integer/toHexString (System/identityHashCode state)))
-            requested-ref                                                     (volatile! (long 0))
-            inner-sub-ref                                                     (volatile! nil)
-            outer-done-ref                                                    (volatile! false)
-            outer-pending-ref                                                 (volatile! false)
-            inner-live-ref                                                    (volatile! false)
-            cancelled-ref                                                     (volatile! false)
-            ^AtomicBoolean terminal-ref                                       (AtomicBoolean. false)
-            complete!                                                         (fn []
-                                                                                (let [won? (.compareAndSet terminal-ref false true)]
-                                                                                  (dbg/dlog pub-id " complete! won?=" won?)
-                                                                                  (when won? (.onComplete downstream))))
-            fail!                                                             (fn [t]
-                                                                                (let [won? (.compareAndSet terminal-ref false true)]
-                                                                                  (dbg/dlog pub-id " fail! won?=" won? " type=" (.getSimpleName (class t)))
-                                                                                  (when won? (.onError downstream t))))
-            request-next-result!
+      (let [state                                                                   (Object.)
+            ^ArrayList buf                                                          (ArrayList. (int chunk-size))
+            up-sub                                                                  (volatile! nil)
+            demand                                                                  (long-array 1)
+            collecting                                                              (volatile! false)
+            done                                                                    (volatile! false)
+            cancelled                                                               (volatile! false)
+            ^AtomicBoolean term                                                     (AtomicBoolean. false)
+            start-collect!
             (fn []
-              (let [[^Subscription outer-sub reason]
+              (let [^Subscription s
                     (locking state
-                      (let [ok (and (not @cancelled-ref)
-                                    (not @outer-done-ref)
-                                    (not @outer-pending-ref)
-                                    (not @inner-live-ref)
-                                    (nil? @inner-sub-ref)
-                                    (pos? ^long @requested-ref)
-                                    @result-sub-ref)]
-                        (if ok
-                          (do (vreset! outer-pending-ref true)
-                              [@result-sub-ref nil])
-                          [nil (cond @cancelled-ref               :cancelled
-                                     @outer-done-ref              :outer-done
-                                     @outer-pending-ref           :outer-pending
-                                     @inner-live-ref              :inner-live
-                                     (some? @inner-sub-ref)       :inner-sub
-                                     (not (pos? ^long @requested-ref)) :no-demand
-                                     (nil? @result-sub-ref)       :no-outer-sub
-                                     :else                        :unknown)])))]
-                (dbg/dlog pub-id " req-next-result "
-                          (if outer-sub "TAKE outer.request(1)" (str "SKIP:" reason)))
-                (when outer-sub (.request outer-sub 1))))
-            row-subscriber
+                      (when (and (not @collecting) (not @done) (not @cancelled)
+                                 (pos? (aget demand 0)) @up-sub)
+                        (vreset! collecting true)
+                        @up-sub))]
+                (when s (.request s chunk-size))))
+            up-subscriber
             (reify
               Subscriber
               (onSubscribe [_ s]
-                (let [[cancel? requested] (locking state
-                                            (if @cancelled-ref
-                                              [true (long 0)]
-                                              (do (vreset! inner-sub-ref s)
-                                                  [false
-                                                   ^long @requested-ref])))]
-                  (dbg/dlog pub-id " inner.onSubscribe cancel?=" cancel?
-                            " forward-requested=" requested)
-                  (if cancel?
-                    (.cancel ^Subscription s)
-                    (when (pos? ^long requested)
-                      (.request ^Subscription s ^long requested)))))
-              (onNext [_ row]
-                (let [emit? (locking state
-                              (when-not @cancelled-ref
-                                (vreset! requested-ref
-                                         (long (max 0
-                                                    (unchecked-dec
-                                                     ^long @requested-ref))))
-                                true))]
-                  (when emit? (.onNext downstream row))))
-              (onError [_ t] (fail! t))
+                (let [cancel? (locking state
+                                (if @cancelled
+                                  true
+                                  (do (vreset! up-sub s) false)))]
+                  (if cancel? (.cancel ^Subscription s) (start-collect!))))
+              (onNext [_ x]
+                (let [batch (locking state
+                              (when-not (or @cancelled @done)
+                                (.add buf x)
+                                (when (>= (.size buf) chunk-size)
+                                  (let [v (vec buf)]
+                                    (.clear buf)
+                                    (aset demand 0 (unchecked-dec (aget demand 0)))
+                                    (vreset! collecting false)
+                                    v))))]
+                  (when batch
+                    (.onNext ^Subscriber downstream batch)
+                    (start-collect!))))
+              (onError [_ t]
+                (locking state (vreset! done true))
+                (when (.compareAndSet term false true)
+                  (.onError ^Subscriber downstream t)))
               (onComplete [_]
-                (let [complete-now? (locking state
-                                      (vreset! inner-sub-ref nil)
-                                      (vreset! inner-live-ref false)
-                                      (and @outer-done-ref
-                                           (not @cancelled-ref)))]
-                  (dbg/dlog pub-id " inner.onComplete complete-now?=" complete-now?)
-                  (if complete-now? (complete!) (request-next-result!)))))]
+                (let [tail (locking state
+                             (vreset! done true)
+                             (when (pos? (.size buf))
+                               (let [v (vec buf)] (.clear buf) v)))]
+                  (when (.compareAndSet term false true)
+                    (when tail (.onNext ^Subscriber downstream tail))
+                    (.onComplete ^Subscriber downstream)))))]
         (.onSubscribe
-         downstream
+         ^Subscriber downstream
          (reify
            Subscription
-           (request [_ n]
-             (when (pos? (long n))
-               (let [[^Subscription inner-sub should-complete?]
-                     (locking state
-                       (if @cancelled-ref
-                         [nil false]
-                         (do (vreset! requested-ref
-                                      (add-demand ^long @requested-ref
-                                                  (long n)))
-                             [@inner-sub-ref
-                              (and @outer-done-ref
-                                   (not @inner-live-ref)
-                                   (nil? @inner-sub-ref))])))]
-                 (dbg/dlog pub-id " downstream.request n=" n
-                           " branch=" (cond inner-sub :inner
-                                            should-complete? :complete
-                                            :else :next-result))
-                 (cond inner-sub (.request inner-sub (long n))
-                       should-complete? (complete!)
-                       :else (request-next-result!)))))
+           (request [_ d]
+             (when (pos? (long d))
+               (locking state
+                 (aset demand 0 (add-demand (aget demand 0) (long d))))
+               (start-collect!)))
            (cancel [_]
-             (dbg/dlog pub-id " downstream.cancel already?=" @cancelled-ref)
-             (let [[^Subscription outer-sub ^Subscription inner-sub]
-                   (locking state
-                     (when-not @cancelled-ref (vreset! cancelled-ref true))
-                     [@result-sub-ref @inner-sub-ref])]
-               (when outer-sub (.cancel outer-sub))
-               (when inner-sub (.cancel inner-sub))))))
-        (.subscribe
-         result-pub
-         (reify
-           Subscriber
-           (onSubscribe [_ s]
-             (let [cancel?
-                   (locking state (vreset! result-sub-ref s) @cancelled-ref)]
-               (if cancel? (.cancel ^Subscription s) (request-next-result!))))
-           (onNext [_ result]
-             (let [cancel? (locking state
-                             (vreset! outer-pending-ref false)
-                             (if @cancelled-ref
-                               true
-                               (do (vreset! inner-live-ref true) false)))]
-               (dbg/dlog pub-id " outer.onNext result cancel?=" cancel?)
-               (when-not cancel?
-                 (.subscribe ^Publisher (result-row-pub ^Result result row-xf)
-                             ^Subscriber row-subscriber))))
-           (onError [_ t]
-             (locking state (vreset! outer-pending-ref false))
-             (fail! t))
-           (onComplete [_]
-             (let [complete-now? (locking state
-                                   (vreset! outer-pending-ref false)
-                                   (vreset! outer-done-ref true)
-                                   (and (not @inner-live-ref)
-                                        (nil? @inner-sub-ref)
-                                        (not @cancelled-ref)))]
-               (dbg/dlog pub-id " outer.onComplete complete-now?=" complete-now?)
-               (when complete-now? (complete!))))))))))
+             (let [^Subscription s (locking state
+                                     (vreset! cancelled true)
+                                     @up-sub)]
+               (when s (.cancel s))))))
+        (.subscribe upstream up-subscriber)))))
 
 (defn first-pub-blocking
   "Subscribe to pub, request one item, and return it synchronously.
@@ -306,24 +252,7 @@
     (await-future fut)
     nil))
 
-(defn request-async!
-  "Call Subscription.request(n) on sub asynchronously.
-
-  Schedules the request on the Missionary blocking executor (m/blk) to avoid
-  re-entrant driver callbacks and prevent ForkJoinPool starvation.
-
-  Args:
-    sub - Subscription to request from.
-    n   - number of items to request."
-  [^Subscription sub ^long n]
-  (CompletableFuture/runAsync (fn [] (.request sub n)) m/blk))
-
 (comment
-  (resolve-fetch-size {})
-  (resolve-fetch-size {:fetch-size 64})
-  (resolve-fetch-size {:fetch-size 0})
-  (add-demand 10 5)
-  (add-demand Long/MAX_VALUE 1)
   (let [f (java.util.concurrent.CompletableFuture.)]
     (.complete f :ok)
     (await-future f))
@@ -370,12 +299,4 @@
                                           org.reactivestreams.Subscription
                                           (request [_ _] (.onComplete s))
                                           (cancel [_])))))
-                      (volatile! nil))
-  (let [latch (java.util.concurrent.CountDownLatch. 1)
-        sub   (reify
-                org.reactivestreams.Subscription
-                (request [_ _] (.countDown latch))
-                (cancel [_]))
-        fut   (request-async! sub 1)]
-    (.await latch 2 java.util.concurrent.TimeUnit/SECONDS)
-    (.isDone fut)))
+                      (volatile! nil)))
