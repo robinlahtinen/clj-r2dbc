@@ -9,14 +9,13 @@
                built value (when :builder-fn supplied), or one vector per
                :chunk-size batch (when :chunk-size supplied). Renamed from plan*.
 
-  Note: RowCursor is a shared mutable object. The same instance is mutated for
-  every row emitted by stream*. A cursor-row read outside the reduce step that
-  produced it throws IllegalStateException (the generation guard). Callers that
-  need to keep row data must either:
-    (a) supply :builder-fn (recommended) to materialize an immutable value, or
-    (b) call (cursor-row c) and (cursor-cache c) immediately within the same
-        reduce step and pass them to impl/sql/row's row->map before the next
-        row arrives.
+  Note: in flyweight mode (no :builder-fn) stream* emits a distinct immutable
+  RowCursor per row, fully materialised inside result-row-pub's .map while the
+  Row's ByteBuf is live. Each emission is its own value, so it is safe to read
+  within the reduce step or retain and read later. Flyweight differs from the
+  :builder-fn path only in the SHAPE of the emitted value (a RowCursor exposing
+  cursor-row/cursor-cache vs. an immutable value). Read cursor data with
+  impl/sql/row's row->map applied to (cursor-row c) / (cursor-cache c).
 
   Backpressure architecture:
     stream* delegates to lifecycle/streaming-plan-flow, which flattens R2DBC's
@@ -30,10 +29,10 @@
       consumer m/reduce -> m/subscribe(rows Publisher) -> concatMap
         -> Subscription.request(1) -> R2DBC driver -> database cursor
 
-    Chunking (:chunk-size) is a partition-all transducer (m/eduction) over the
-    per-row flow, so the consumer performs O(batches) transfers; flyweight mode
-    maps each row onto a shared RowCursor. No eager collection - rows stream from
-    database to consumer.
+    Chunking (:chunk-size) batches rows below the bridge (Reactor buffer), so the
+    consumer performs O(batches) transfers; flyweight mode maps each row onto a
+    fresh immutable RowCursor. No eager collection - rows stream from database to
+    consumer.
 
   This namespace is an implementation detail; do not use from application code."
   (:require
@@ -46,6 +45,7 @@
    [missionary.core :as m])
   (:import
    (clj_r2dbc.impl.connection ConnectableWithOpts)
+   (clj_r2dbc.impl.sql.row RowMetadataCache)
    (io.r2dbc.spi Connection ConnectionFactory Row)))
 
 (set! *warn-on-reflection* true)
@@ -55,10 +55,10 @@
   "Return a Missionary flow that emits one value per row returned by sql.
   Renamed from plan*; semantics are identical.
 
-  Without :builder-fn - emits a shared mutable RowCursor (flyweight). The same
-  instance is updated in-place for each row. Do NOT retain references across
-  m/?> boundaries; silent data corruption otherwise. Materialize data
-  immediately using cursor-row and cursor-cache within the same reduce step.
+  Without :builder-fn - emits a distinct immutable RowCursor (flyweight) per row,
+  each materialised inside result-row-pub's .map while the Row's ByteBuf is live.
+  Safe to read within the reduce step or retain and read later. Read cursor data
+  with cursor-row and cursor-cache (pass to impl/sql/row's row->map).
 
   With :builder-fn (fn [Row RowMetadata] -> value) - applied per row inside
   result-row-pub's BiFunction, emitting an immutable value safe for retention.
@@ -78,9 +78,10 @@
                :chunk-size - rows per emitted vector; requires :builder-fn.
                :qualifier  - column keyword mode used when no :builder-fn is supplied.
                :fetch-size - rows per database round-trip batch (default 128),
-                             applied to Statement.fetchSize. Clamped to 1 in
-                             flyweight mode (no :builder-fn): the R2DBC SPI permits
-                             drivers to recycle Row objects after onNext returns.
+                             applied to Statement.fetchSize. Flyweight mode no
+                             longer clamps this: values are materialised per row
+                             in .map (ByteBuf live), exactly like :builder-fn, so
+                             driver Row recycling after onNext is harmless.
                :returning  - calls Statement.returnGeneratedValues.
 
   Connection lifecycle:
@@ -96,12 +97,11 @@
     true end-to-end streaming from database to consumer.
 
   Zero-copy:
-    With :builder-fn, row-xf materializes values inside result-row-pub's
-    BiFunction.apply() while the underlying ByteBuf is guaranteed live, so
-    emitted builder values are safe to hold across deref boundaries.
-    In flyweight mode (no :builder-fn), row-xf is identity and fetch-size is
-    clamped to 1; each row is materialized into the cursor within the same
-    consumer step it is delivered."
+    Both modes materialize values inside result-row-pub's BiFunction.apply()
+    while the underlying ByteBuf is guaranteed live. With :builder-fn the builder
+    produces an immutable value; in flyweight mode (no :builder-fn) the row's
+    columns are read into a fresh Object[] wrapped in a new RowCursor. Either way
+    the emitted value owns its data and is safe to hold across deref boundaries."
   [db sql params opts]
   (let [[db opts]  (conn/resolve-connectable db opts)
         chunk-size (:chunk-size opts)
@@ -133,30 +133,37 @@
          (builder-fn row (.getMetadata row))))
 
       :else
-      (let [crs            (cursor/->cursor)
-            flyweight-opts (assoc opts :fetch-size 1)]
+      (let [meta (volatile! nil)]
         ;; cursor-step is the row-xf, applied inside result-row-pub's .map while
         ;; the Row's ByteBuf is live: it materialises the row's column values into
-        ;; the cursor's reused storage (capture!) and emits the shared cursor. The
-        ;; flow is consumed directly (no m/eduction, which races m/subscribe and
-        ;; pre-advances upstream); reads never touch a released ByteBuf.
+        ;; a FRESH Object[] and emits a new immutable RowCursor per row. The
+        ;; per-result metadata (cache, name-index, RowMetadata) is built once and
+        ;; shared (immutable). Because every emission is its own value, the
+        ;; m/subscribe bridge requesting row N+1 before the consumer reads row N
+        ;; (Sub.transfer; see lifecycle) cannot corrupt an already-emitted cursor -
+        ;; the same per-row-materialisation property that makes :builder race-free.
         (lifecycle/streaming-plan-flow
          db
          sql
          params
-         flyweight-opts
+         opts
          (fn cursor-step [^Row row]
-           (when (nil? (cursor/cursor-cache crs))
-             (let [q   (:qualifier opts :unqualified-kebab)
-                   rmd (.getMetadata ^Row row)
-                   qfn (fn qualify-fn [^String col _]
-                         (row/qualify-column col nil q))]
-               (cursor/-set-meta! crs
-                                  (row/build-metadata-cache rmd qfn)
-                                  (row/build-name-index rmd)
-                                  rmd)))
-           (cursor/-capture! crs row)
-           crs))))))
+           (let [m                          (or @meta
+                                                (let [q   (:qualifier opts :unqualified-kebab)
+                                                      rmd (.getMetadata row)
+                                                      qfn (fn qualify-fn [^String col _]
+                                                            (row/qualify-column col nil q))]
+                                                  (vreset! meta
+                                                           {:cache     (row/build-metadata-cache rmd qfn)
+                                                            :name->idx (row/build-name-index rmd)
+                                                            :rmd       rmd})))
+                 ^RowMetadataCache cache    (:cache m)
+                 n                          (.col-count cache)
+                 ^"[Ljava.lang.Object;" tys (.java-types cache)
+                 vs                         (object-array n)]
+             (dotimes [i n]
+               (aset vs i (.get row (int i) ^Class (aget tys i))))
+             (cursor/->cursor vs cache (:name->idx m) (:rmd m)))))))))
 
 (extend-protocol proto/Streamable
   ConnectionFactory

@@ -32,6 +32,22 @@
                               (r2dbc/stream db sql {:params [], :stream-mode :flyweight})))]
           (is (= n (count rows)))
           (is (= (range 1 (inc n)) (map :id rows)))
+          (is (every? (fn [r] (= (str "name-" (:id r)) (:name r))) rows))))
+      (testing "flyweight cursors are per-row immutable: retained and read after the stream"
+        ;; Retains every emitted cursor, then materialises them only AFTER the
+        ;; stream completes. A shared/recycled cursor would return the last row n
+        ;; times (or freed-ByteBuf garbage); per-row isolation makes it correct -
+        ;; the real-Netty guard for the request-ahead corruption (CI [2 2 3]).
+        (let [n       5000
+              sql     (str "SELECT g AS id, ('name-' || g) AS name"
+                           " FROM generate_series(1, " n ") g ORDER BY g")
+              cursors (fx/run-task!
+                       (m/reduce conj []
+                                 (r2dbc/stream db sql {:params [], :stream-mode :flyweight})))
+              rows    (mapv #(row/row->map (cursor/cursor-row %) (cursor/cursor-cache %))
+                            cursors)]
+          (is (= n (count rows)))
+          (is (= (range 1 (inc n)) (map :id rows)))
           (is (every? (fn [r] (= (str "name-" (:id r)) (:name r))) rows)))))))
 
 (deftest ^:integration postgresql-byodb-smoke-test

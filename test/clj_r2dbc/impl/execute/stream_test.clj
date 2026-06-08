@@ -110,16 +110,16 @@
       (is (= 3 (count rows)))
       (is (= 3 (count (into #{} (map #(System/identityHashCode %) rows))))))))
 
-(deftest plan-cursor-flyweight-same-instance-test
+(deftest plan-cursor-flyweight-distinct-instance-test
   (testing
-   "without :builder-fn, all emitted values are the same mutable RowCursor instance"
+   "without :builder-fn, each row is emitted as a distinct immutable RowCursor"
     (let [cf      (get-factory)
           cursors (db/run-task!
                    (m/reduce conj [] (stream/stream* cf select-all [] {})))]
       (is (= 3 (count cursors)))
       (is (every? #(instance? RowCursor %) cursors))
-      (let [first-cursor (first cursors)]
-        (is (every? #(identical? first-cursor %) cursors))))))
+      (is (= 3 (count (into #{} (map #(System/identityHashCode %) cursors))))
+          "each row yields its own cursor instance, never a shared/recycled one"))))
 
 (deftest plan-cursor-read-immediately-test
   (testing
@@ -138,52 +138,20 @@
       (is (= 2 (:id (second rows))))
       (is (= 3 (:id (nth rows 2)))))))
 
-(deftest plan-stale-row-guard-test
-  (testing "retaining cursor-row across emissions throws IllegalStateException"
-    (let [cf    (get-factory)
-          rows  (db/run-task! (m/reduce (fn [acc cursor]
-                                          (conj acc (cursor/cursor-row cursor)))
-                                        []
-                                        (stream/stream* cf select-all [] {})))
-          stale (first rows)]
-      (is (thrown-with-msg? IllegalStateException
-                            #"RowCursor advanced; stale row reference."
-                            (.get ^Row stale (int 0) Object))))))
-
-(deftest ^:pattern-1 plan-generation-counter-monotonic-test
-  (testing "generation counter increments exactly once per row advance"
-    (let [cf   (get-factory)
-          gens (db/run-task! (m/reduce
-                              (fn [acc cursor]
-                                (conj acc (cursor/cursor-generation cursor)))
-                              []
-                              (stream/stream* cf select-all [] {})))]
-      (is (= 3 (count gens)))
-      (is (apply < gens))
-      (is (every? #(= 1 %) (map - (rest gens) gens))))))
-
-(deftest ^:pattern-1 plan-stale-row-guard-fires-exactly-after-advance-test
+(deftest ^:pattern-1 plan-cursor-retention-safe-test
   (testing
-   "GenerationGuard allows field access during step; earlier guards become stale after cursor advance"
-    (let [cf                                                                    (get-factory)
-          guard-entries
-          (db/run-task!
-           (m/reduce (fn [acc cursor]
-                       (let [guard (cursor/cursor-row cursor)
-                             ok?   (try (.get ^Row guard (int 0) Object)
-                                        true
-                                        (catch IllegalStateException _ false))]
-                         (conj acc {:guard guard, :ok? ok?})))
-                     []
-                     (stream/stream* cf select-all [] {})))]
-      (is (every? :ok? guard-entries))
-      (let [non-last (butlast guard-entries)]
-        (is (pos? (count non-last)))
-        (is (every? (fn [{:keys [guard]}]
-                      (try (.get ^Row guard (int 0) Object)
-                           false
-                           (catch IllegalStateException _ true)))
-                    non-last))))))
+   "flyweight cursors are immutable per row: retaining every cursor and reading
+   it only after the stream completes still yields correct per-row data (the
+   shared-mutable hazard is gone). This is the regression guard for the
+   request-ahead corruption that surfaced on the 2-core CI runner."
+    (let [cf      (get-factory)
+          cursors (db/run-task!
+                   (m/reduce conj [] (stream/stream* cf select-all [] {})))
+          rows    (mapv #(row/row->map (cursor/cursor-row %) (cursor/cursor-cache %))
+                        cursors)]
+      (is (= 3 (count rows)))
+      (is (= [1 2 3] (mapv :id rows)))
+      (is (= ["Alice" "Bob" "Carol"] (mapv :name rows))))))
 
 (deftest plan-cancellation-test
   (testing "plan* flow can be cancelled mid-stream; connection is cleaned up"

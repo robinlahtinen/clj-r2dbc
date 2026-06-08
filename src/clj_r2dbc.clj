@@ -251,12 +251,11 @@
   acquired at flow invocation, released on completion, error, or cancellation.
   When db is an existing Connection, the caller owns the lifecycle.
 
-  Flyweight warning: When :stream-mode is :flyweight, the flow emits a single
-  shared RowCursor instance that is mutated in-place for every row. Retaining a
-  reference to the cursor past the current m/?> boundary silently returns data
-  from a later row - no exception is thrown. Always materialize cursor data
-  within the same reduce step. The default :stream-mode :immutable avoids this
-  hazard entirely.
+  Flyweight mode: When :stream-mode is :flyweight, the flow emits a distinct
+  immutable RowCursor per row (read its data via clj-r2dbc.row helpers within or
+  after the reduce step). It is materialized while the row's buffer is live, so
+  it is safe to read or retain - it differs from :immutable only in the shape of
+  the emitted value (a RowCursor vs. a built map).
 
   Args:
     db   - ConnectionFactory, Connection, or wrapped connectable (from with-options).
@@ -274,7 +273,7 @@
                     when using :chunk-size.
     :stream-mode  - :immutable (default) or :flyweight.
                     :immutable - applies :builder per row; emits immutable values.
-                    :flyweight - emits a shared mutable RowCursor; see warning above.
+                    :flyweight - emits a distinct immutable RowCursor per row; see above.
     :chunk-size   - integer in [1, 32768]. Changes emission unit from individual
                     rows to java.util.ArrayList chunks of up to chunk-size
                     elements. Requires :builder. Reduces Missionary scheduler

@@ -2,31 +2,28 @@
 ;;  Licensed under the MIT License. See LICENSE in the project root for license information.
 
 (ns clj-r2dbc.impl.sql.cursor
-  "RowCursor flyweight and generation guard for clj-r2dbc streaming.
+  "RowCursor flyweight for clj-r2dbc streaming.
 
   Provides:
-    Cursor          - protocol for type-safe access to mutable RowCursor fields.
-    GenerationGuard - Row view returned by cursor-row; reads the cursor's
-                      materialised column values and guards against stale reads
-                      after the cursor advances to the next row.
-    RowCursor       - shared mutable flyweight constructed once per stream* call;
-                      reused for every row emitted.
+    Cursor    - protocol for type-safe access to a RowCursor's fields.
+    RowView   - immutable Row view over one row's materialised column values.
+    RowCursor - per-row immutable holder emitted in flyweight streaming mode
+                (when no :builder is supplied).
 
-  Zero-copy without dangling ByteBufs: column values are read into the cursor's
-  reused Object[] storage by capture! INSIDE result-row-pub's Result.map - while
-  the Row's backing ByteBuf is live - rather than stashing a raw Row to read in
-  the consumer step (which reads freed memory once the row publisher advances and
-  releases the ByteBuf; see impl/connection/lifecycle). cursor-row then reads the
-  already-materialised values, so it is safe regardless of when the consumer
-  reads relative to the publisher's release.
+  Zero dangling ByteBufs, zero shared mutable state: each row's column values are
+  read into a fresh Object[] by stream*'s cursor-step INSIDE result-row-pub's
+  Result.map - while the Row's backing ByteBuf is live - and wrapped in a new
+  RowCursor per row. The per-result metadata (RowMetadataCache, name->index map,
+  RowMetadata) is immutable and shared safely across the cursors of one stream.
 
-  Note: RowCursor is a shared mutable object. The same instance is mutated for
-  every row emitted by stream*. Retaining a cursor-row beyond the current step
-  reads the next row's values - the GenerationGuard throws IllegalStateException
-  in that case. Callers that need to keep row data must either:
-    (a) supply :builder-fn (recommended) to materialize an immutable value, or
-    (b) call cursor-row and cursor-cache immediately within the same reduce step
-        and pass them to impl/sql/row's row->map before the next row arrives.
+  Because every emitted RowCursor is a distinct immutable value, it is safe to
+  read at any time - within the reduce step or retained and read later - and the
+  flyweight differs from the default :builder mode only in the SHAPE of the
+  emitted value (a RowCursor exposing cursor-row/cursor-cache vs. an immutable
+  map). This is the same per-row-materialisation property that makes :builder
+  mode race-free: the producer materialises before emitting, so a reactive bridge
+  that requests the next row before the consumer reads the current one (Missionary
+  m/subscribe; see impl/connection/lifecycle) can never clobber an emitted value.
 
   This namespace is an implementation detail; do not use from application code."
   (:require
@@ -39,124 +36,64 @@
 (set! *unchecked-math* :warn-on-boxed)
 
 (defprotocol Cursor
-  "Protocol for type-safe access to RowCursor's mutable fields.
+  "Protocol for type-safe access to a RowCursor's fields.
   Used by callers that consume the flyweight cursor directly (e.g., tests,
   custom reduction functions)."
   (cursor-row [this]
-    "Return a Row view of the current materialised values (valid only within the
-    current step).")
+    "Return an immutable Row view over this cursor's materialised column values.")
   (cursor-cache [this]
-    "Return the current RowMetadataCache.")
-  (cursor-generation [this]
-    "Return the monotonic cursor generation.")
-  (-values [this]
-    "Internal: the cursor's reused column-value array.")
-  (-name->idx [this]
-    "Internal: the column-name -> index map.")
-  (-row-metadata [this]
-    "Internal: the current RowMetadata.")
-  (-capture! [this row]
-    "Internal: read row's columns into the reused value array, advancing the
-    generation. Must be called while the Row's ByteBuf is live (in Result.map).")
-  (-set-meta! [this cache name->idx rmd]
-    "Internal: install the per-result metadata (built once on the first row)."))
-
-(defn- stale-row-ex
-  []
-  (IllegalStateException. "RowCursor advanced; stale row reference."))
+    "Return this cursor's RowMetadataCache."))
 
 (deftype
  ^{:doc
-   "A Row view over the cursor's materialised values that guards against stale
-   reads.
+   "Immutable Row view over one row's materialised column values.
 
    Fields:
-     generation - the cursor generation at the time this guard was created.
-     cursor     - the RowCursor whose generation and values are read.
+     values    - Object[] of this row's column values, indexed by column position.
+     name->idx - column-name -> index map (shared, immutable).
+     rmd       - the RowMetadata for this result (shared, immutable).
 
-   Reads the cursor's reused value array by index (or by name via the cursor's
-   name->index map) only if the cursor generation still matches; throws
-   IllegalStateException otherwise. Used in flyweight streaming mode to detect
-   out-of-step row access."}
- GenerationGuard
- [^long generation cursor]
+   Reads are pure array/map lookups; the view holds its own value array, so it is
+   valid for the lifetime of the cursor that produced it - there is no staleness."}
+ RowView
+ [^objects values name->idx ^RowMetadata rmd]
   Row
-  (^Object get
-    [_ ^int index]
-    (if (= generation (cursor-generation cursor))
-      (aget ^objects (-values cursor) index)
-      (throw (stale-row-ex))))
-  (^Object get
-    [_ ^String name]
-    (if (= generation (cursor-generation cursor))
-      (aget ^objects (-values cursor) (int (get (-name->idx cursor) name)))
-      (throw (stale-row-ex))))
-  (^Object get
-    [_ ^int index ^Class _type]
-    (if (= generation (cursor-generation cursor))
-      (aget ^objects (-values cursor) index)
-      (throw (stale-row-ex))))
-  (^Object get
-    [_ ^String name ^Class _type]
-    (if (= generation (cursor-generation cursor))
-      (aget ^objects (-values cursor) (int (get (-name->idx cursor) name)))
-      (throw (stale-row-ex))))
-  (getMetadata [_]
-    (if (= generation (cursor-generation cursor))
-      (-row-metadata cursor)
-      (throw (stale-row-ex)))))
+  (^Object get [_ ^int index] (aget values index))
+  (^Object get [_ ^String name] (aget values (int (get name->idx name))))
+  (^Object get [_ ^int index ^Class _type] (aget values index))
+  (^Object get [_ ^String name ^Class _type] (aget values (int (get name->idx name))))
+  (getMetadata [_] rmd))
 
 (deftype
  ^{:doc
-   "Shared mutable cursor passed as the per-step value in flyweight streaming.
+   "Per-row immutable holder emitted as the per-step value in flyweight streaming.
 
    Fields:
-     _values     - reused Object[] of the current row's materialised column
-                   values (unsynchronized-mutable; grown to col-count on first
-                   capture).
-     _cache      - the current RowMetadataCache (unsynchronized-mutable).
-     _name->idx  - column-name -> index map (unsynchronized-mutable).
-     _rmd        - the current RowMetadata (unsynchronized-mutable).
-     _generation - monotonic counter incremented on each capture (volatile).
+     values    - Object[] of this row's materialised column values.
+     cache     - the RowMetadataCache (shared across the stream's cursors).
+     name->idx - column-name -> index map (shared, immutable).
+     rmd       - the RowMetadata (shared, immutable).
 
-   capture! materialises the row's columns into _values while the ByteBuf is
-   live; all access outside the current step is guarded by GenerationGuard."}
+   A distinct instance is constructed per row inside result-row-pub's Result.map;
+   cursor-row wraps the values in a RowView, cursor-cache returns the cache for
+   use with impl/sql/row's row->map. Safe to read or retain at any time."}
  RowCursor
- [^:unsynchronized-mutable ^objects _values
-  ^:unsynchronized-mutable ^RowMetadataCache _cache
-  ^:unsynchronized-mutable _name->idx
-  ^:unsynchronized-mutable ^RowMetadata _rmd
-  ^:volatile-mutable ^long _generation]
+ [^objects values ^RowMetadataCache cache name->idx ^RowMetadata rmd]
   Cursor
-  (cursor-row [this] (->GenerationGuard _generation this))
-  (cursor-cache [_] _cache)
-  (cursor-generation [_] _generation)
-  (-values [_] _values)
-  (-name->idx [_] _name->idx)
-  (-row-metadata [_] _rmd)
-  (-capture! [this row]
-    (let [^RowMetadataCache c        _cache
-          n                          (.col-count c)
-          ^"[Ljava.lang.Object;" tys (.java-types c)
-          ^"[Ljava.lang.Object;" vs  (if (and _values (= (alength ^objects _values) n))
-                                       _values
-                                       (object-array n))]
-      (dotimes [i n]
-        (aset vs i (.get ^Row row (int i) ^Class (aget tys i))))
-      (set! _values vs)
-      (set! _generation (unchecked-inc _generation))
-      this))
-  (-set-meta! [this cache name->idx rmd]
-    (set! _cache cache)
-    (set! _name->idx name->idx)
-    (set! _rmd rmd)
-    this))
+  (cursor-row [_] (->RowView values name->idx rmd))
+  (cursor-cache [_] cache))
 
 (defn ->cursor
-  "Construct an empty RowCursor for one stream* invocation."
-  []
-  (->RowCursor nil nil nil nil 0))
+  "Construct a RowCursor for one materialised row.
+
+  Args:
+    values    - Object[] of the row's column values (read while the ByteBuf was live).
+    cache     - RowMetadataCache for the result.
+    name->idx - column-name -> index map.
+    rmd       - RowMetadata for the result."
+  [values cache name->idx rmd]
+  (->RowCursor values cache name->idx rmd))
 
 (comment
-  (def crs (->cursor))
-  (cursor-generation crs))
+  (def crs (->cursor (object-array [1 "Alice"]) nil {"id" 0, "name" 1} nil))
+  (.get ^Row (cursor-row crs) (int 0)))
