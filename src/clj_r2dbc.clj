@@ -268,12 +268,12 @@
                     Subscription.request(N) batch size.
     :builder      - (fn [Row RowMetadata] -> value), default
                     clj-r2dbc.row/kebab-maps. Applied inside the fetch loop
-                    while Row is valid. Values are safe to retain. Required
-                    when using :chunk-size.
-    :chunk-size   - integer in [1, 32768]. Changes emission unit from individual
-                    rows to java.util.ArrayList chunks of up to chunk-size
-                    elements. Requires :builder. Reduces Missionary scheduler
-                    overhead from O(rows) to O(batches).
+                    while Row is valid. Values are safe to retain.
+    :chunk-size   - integer in [1, 32768]. Changes the emission unit from
+                    individual rows to vectors of up to chunk-size built values
+                    (orthogonal to :builder; uses the same builder, default
+                    kebab-maps). Reduces Missionary scheduler overhead from
+                    O(rows) to O(batches).
     :returning    - boolean or vector of column names. Calls
                     Statement.returnGeneratedValues().
     :middleware   - sequential of middleware fns. Mutually exclusive with
@@ -286,8 +286,6 @@
   combinator. This is not a task - it can't be awaited with m/? directly.
 
   Throws (synchronously):
-    ex-info :clj-r2dbc/missing-key    when :chunk-size is present but :builder is
-                                       absent.
     ex-info :clj-r2dbc/invalid-type   when sql is not a string, or :builder is not
                                        a function.
     ex-info :clj-r2dbc/invalid-value  when sql is blank, or :chunk-size or
@@ -303,12 +301,10 @@
     ;; Keyword-arg form:
     (m/? (m/reduce conj [] (stream db \"SELECT id FROM users\" :fetch-size 128)))
 
-    ;; Chunk mode - emit ArrayList chunks; :builder required
-    (require '[clj-r2dbc.row :as row])
-    (m/? (m/reduce #(+ %1 (.size ^java.util.ArrayList %2))
+    ;; Chunk mode - emit vectors of up to :chunk-size built values
+    (m/? (m/reduce #(+ %1 (count %2))
                    0
-                   (stream db \"SELECT 1\"
-                           {:builder row/kebab-maps :chunk-size 64})))"
+                   (stream db \"SELECT 1\" {:chunk-size 64})))"
   ([db sql & {:as opts}]
    (v/require-non-nil! db "db" :clj-r2dbc/stream)
    (v/require-non-blank-string! sql "sql" :clj-r2dbc/stream)

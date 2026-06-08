@@ -57,8 +57,9 @@
   Chunking happens below the Missionary bridge so the single m/subscribe flow is
   still consumed directly by m/reduce; a transducer (m/eduction) or m/?> over the
   bridge would reintroduce the synchronous-publisher fork race (see ns docstring).
-  :chunk-size requires :builder-fn, so buffered values are materialized - safe to
-  batch across the bridge (raw un-materialized Rows would not be)."
+  row-xf (the builder, defaulting to kebab-maps) materializes each row before it
+  is buffered, so buffered values are safe to batch across the bridge (raw
+  un-materialized Rows would not be)."
   ^Publisher [^Publisher rows ^long chunk-size]
   (.map (.buffer (Flux/from rows) (int chunk-size))
         (reify Function (apply [_ batch] (vec batch)))))

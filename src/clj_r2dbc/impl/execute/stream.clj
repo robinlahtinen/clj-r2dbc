@@ -53,10 +53,11 @@
   no-builder call emits standard kebab-case row maps. Every emission is an
   immutable value, safe to read within the reduce step or retain and read later.
 
-  With :chunk-size - requires :builder-fn; emits one vector of up to chunk-size
-  built values per emission (the final vector may be shorter). Batching is a
-  partition-all transducer over the per-row flow, so the consumer performs
-  O(batches) transfers.
+  With :chunk-size - emits one vector of up to chunk-size built values per
+  emission (the final vector may be shorter). :chunk-size only changes the
+  emission unit, not the row representation: it uses the same builder as the
+  per-row path (default kebab-maps). Batching happens below the bridge (Reactor
+  buffer), so the consumer performs O(batches) transfers.
 
   Args:
     db     - ConnectionFactory, Connection, or ConnectableWithOpts.
@@ -65,7 +66,8 @@
     opts   - options map:
                :builder-fn - 2-arity (Row, RowMetadata) -> value; defaults to
                              clj-r2dbc.row/kebab-maps when absent.
-               :chunk-size - rows per emitted vector; requires :builder-fn.
+               :chunk-size - rows per emitted vector; uses the same builder as
+                             the per-row path.
                :fetch-size - rows per database round-trip batch (default 128),
                              applied to Statement.fetchSize. Independent of
                              reactive demand.
@@ -90,38 +92,21 @@
   [db sql params opts]
   (let [[db opts]  (conn/resolve-connectable db opts)
         chunk-size (:chunk-size opts)
-        builder-fn (:builder-fn opts)]
-    (cond
-      chunk-size
-      (do (when-not builder-fn
-            (throw (ex-info "stream* with :chunk-size requires :builder-fn"
-                            {:clj-r2dbc/error   :clj-r2dbc/missing-key
-                             :clj-r2dbc/context :stream
-                             :key               :builder-fn})))
-          ;; :chunk-size in opts selects chunked-pub (Reactor buffer) below the
-          ;; bridge in streaming-plan-flow; statement fetch batching is aligned.
-          (lifecycle/streaming-plan-flow
-           db
-           sql
-           params
-           (assoc opts :fetch-size (long chunk-size))
-           (fn chunk-builder-xf [^Row row]
-             (builder-fn row (.getMetadata row)))))
-
-      :else
-      ;; One row representation: the builder (defaulting to kebab-maps) is applied
-      ;; per row inside result-row-pub's .map while the ByteBuf is live, emitting a
-      ;; distinct immutable value. Because every emission is its own value, the
-      ;; m/subscribe bridge requesting row N+1 before the consumer reads row N
-      ;; (Sub.transfer; see lifecycle) can never corrupt an already-emitted value.
-      (let [bf (or builder-fn pub-row/kebab-maps)]
-        (lifecycle/streaming-plan-flow
-         db
-         sql
-         params
-         opts
-         (fn row-builder-xf [^Row row]
-           (bf row (.getMetadata row))))))))
+        bf         (or (:builder-fn opts) pub-row/kebab-maps)
+        ;; The builder (defaulting to kebab-maps) is applied per row inside
+        ;; result-row-pub's .map while the ByteBuf is live, so every emission is a
+        ;; distinct immutable value - the m/subscribe bridge requesting row N+1
+        ;; before the consumer reads row N (Sub.transfer; see lifecycle) can never
+        ;; corrupt an already-emitted value. :chunk-size and :builder are
+        ;; orthogonal: chunking only changes the emission unit (a Reactor buffer
+        ;; below the bridge groups built values into vectors), not the builder.
+        row-xf     (fn row-builder-xf [^Row row]
+                     (bf row (.getMetadata row)))]
+    (if chunk-size
+      (lifecycle/streaming-plan-flow
+       db sql params (assoc opts :fetch-size (long chunk-size)) row-xf)
+      (lifecycle/streaming-plan-flow
+       db sql params opts row-xf))))
 
 (extend-protocol proto/Streamable
   ConnectionFactory

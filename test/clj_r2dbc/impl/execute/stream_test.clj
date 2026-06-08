@@ -132,6 +132,21 @@
       (is (= [1 2 3] (mapv :id rows)))
       (is (= ["Alice" "Bob" "Carol"] (mapv :name rows))))))
 
+(deftest plan-chunk-default-builder-test
+  (testing
+   "without :builder-fn, :chunk-size still streams - it only changes the emission
+   unit (vectors of built values), using the same default kebab-maps builder.
+   Regression guard for the decomplected :chunk-size/:builder contract."
+    (let [cf     (get-factory)
+          chunks (db/run-task!
+                  (m/reduce conj [] (stream/stream* cf select-all [] {:chunk-size 2})))]
+      (is (= 2 (count chunks)) "3 rows at chunk-size 2 -> [2 1]")
+      (is (every? vector? chunks))
+      (is (every? (fn [chunk] (every? map? chunk)) chunks))
+      (is (= [[{:id 1 :name "Alice"} {:id 2 :name "Bob"}]
+              [{:id 3 :name "Carol"}]]
+             chunks)))))
+
 (deftest plan-cancellation-test
   (testing "plan* flow can be cancelled mid-stream; connection is cleaned up"
     (let [cf                                                                    (get-factory)
