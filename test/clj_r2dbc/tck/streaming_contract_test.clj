@@ -4,7 +4,6 @@
 (ns clj-r2dbc.tck.streaming-contract-test
   (:require
    [clj-r2dbc :as r2dbc]
-   [clj-r2dbc.impl.sql.cursor :as cursor]
    [clj-r2dbc.impl.sql.row :as row]
    [clj-r2dbc.integration.fixtures :as fx]
    [clj-r2dbc.test-util.db :as db]
@@ -151,21 +150,19 @@
                                     "SELECT COUNT(*) AS cnt FROM people")))]
         (is (= 10003 (:cnt (first rows))))))))
 
-(deftest ^:tck flyweight-streaming-test
-  (testing "stream without :builder streams rows via flyweight cursor"
+(deftest ^:tck default-builder-streaming-test
+  (testing "stream without :builder streams rows as default kebab-case maps"
     (insert-n-people! 97 4)
     (let [rows (db/run-task!
                 (m/reduce
-                 (fn [acc cursor]
-                   (conj acc
-                         (row/row->map (cursor/cursor-row cursor)
-                                       (cursor/cursor-cache cursor))))
+                 conj
                  []
                  (r2dbc/stream
                   tck-db
                   "SELECT id, name FROM people ORDER BY id"
-                  {:params [], :stream-mode :flyweight, :fetch-size 32})))]
+                  {:params [], :fetch-size 32})))]
       (is (= 100 (count rows)))
+      (is (every? map? rows))
       (is (= 1 (:id (first rows))))
       (is (= 100 (:id (last rows)))))))
 

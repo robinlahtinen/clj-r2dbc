@@ -91,11 +91,9 @@
   exists for the synchronous case but is applied uniformly.
 
   subscribeOn is deliberately chosen over publishOn: publishOn inserts a prefetch
-  queue (default 256) that both defeats the request(1)/fetchSize-1 backpressure
-  this design maintains and buffers Rows across the thread boundary - unsafe in
-  flyweight mode where the emitted value is a live-ByteBuf-backed Row.
-  subscribeOn relays each request(1) verbatim and buffers nothing (verified: max
-  upstream request stays 1).
+  queue (default 256) that defeats the request(1)/fetchSize-1 backpressure this
+  design maintains. subscribeOn relays each request(1) verbatim and buffers
+  nothing (verified: max upstream request stays 1).
 
   Args:
     pub - Publisher to subscribe to / emit from on m/blk.

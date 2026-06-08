@@ -5,17 +5,14 @@
   "Streaming row execution for clj-r2dbc.
 
   Provides:
-    stream*  - Missionary flow emitting one value per row as a RowCursor or
-               built value (when :builder-fn supplied), or one vector per
-               :chunk-size batch (when :chunk-size supplied). Renamed from plan*.
+    stream*  - Missionary flow emitting one immutable value per row (built by
+               :builder-fn, defaulting to clj-r2dbc.row/kebab-maps), or one
+               vector per :chunk-size batch (when :chunk-size supplied).
 
-  Note: in flyweight mode (no :builder-fn) stream* emits a distinct immutable
-  RowCursor per row, fully materialised inside result-row-pub's .map while the
-  Row's ByteBuf is live. Each emission is its own value, so it is safe to read
-  within the reduce step or retain and read later. Flyweight differs from the
-  :builder-fn path only in the SHAPE of the emitted value (a RowCursor exposing
-  cursor-row/cursor-cache vs. an immutable value). Read cursor data with
-  impl/sql/row's row->map applied to (cursor-row c) / (cursor-cache c).
+  Every emission is an immutable value produced by the builder inside
+  result-row-pub's .map while the Row's ByteBuf is live, so it is safe to read
+  within the reduce step or retain and read later. There is one row
+  representation knob - :builder - and no shared mutable state.
 
   Backpressure architecture:
     stream* delegates to lifecycle/streaming-plan-flow, which flattens R2DBC's
@@ -30,39 +27,31 @@
         -> Subscription.request(1) -> R2DBC driver -> database cursor
 
     Chunking (:chunk-size) batches rows below the bridge (Reactor buffer), so the
-    consumer performs O(batches) transfers; flyweight mode maps each row onto a
-    fresh immutable RowCursor. No eager collection - rows stream from database to
-    consumer.
+    consumer performs O(batches) transfers. No eager collection - rows stream
+    from database to consumer.
 
   This namespace is an implementation detail; do not use from application code."
   (:require
    [clj-r2dbc.impl.connection :as conn]
    [clj-r2dbc.impl.connection.lifecycle :as lifecycle]
    [clj-r2dbc.impl.protocols :as proto]
-   [clj-r2dbc.impl.sql.cursor :as cursor]
-   [clj-r2dbc.impl.sql.row :as row]
    [clj-r2dbc.row :as pub-row]
    [missionary.core :as m])
   (:import
    (clj_r2dbc.impl.connection ConnectableWithOpts)
-   (clj_r2dbc.impl.sql.row RowMetadataCache)
    (io.r2dbc.spi Connection ConnectionFactory Row)))
 
 (set! *warn-on-reflection* true)
 (set! *unchecked-math* :warn-on-boxed)
 
 (defn stream*
-  "Return a Missionary flow that emits one value per row returned by sql.
-  Renamed from plan*; semantics are identical.
+  "Return a Missionary flow that emits one immutable value per row returned by sql.
 
-  Without :builder-fn - emits a distinct immutable RowCursor (flyweight) per row,
-  each materialised inside result-row-pub's .map while the Row's ByteBuf is live.
-  Safe to read within the reduce step or retain and read later. Read cursor data
-  with cursor-row and cursor-cache (pass to impl/sql/row's row->map).
-
-  With :builder-fn (fn [Row RowMetadata] -> value) - applied per row inside
-  result-row-pub's BiFunction, emitting an immutable value safe for retention.
-  Use clj-r2dbc.row/kebab-maps for standard kebab-case row maps.
+  The row value is produced by :builder-fn (fn [Row RowMetadata] -> value),
+  applied per row inside result-row-pub's BiFunction while the Row's ByteBuf is
+  live. When :builder-fn is absent it defaults to clj-r2dbc.row/kebab-maps, so a
+  no-builder call emits standard kebab-case row maps. Every emission is an
+  immutable value, safe to read within the reduce step or retain and read later.
 
   With :chunk-size - requires :builder-fn; emits one vector of up to chunk-size
   built values per emission (the final vector may be shorter). Batching is a
@@ -74,14 +63,12 @@
     sql    - SQL string.
     params - sequential bind parameters.
     opts   - options map:
-               :builder-fn - 2-arity (Row, RowMetadata) -> value; skips RowCursor entirely.
+               :builder-fn - 2-arity (Row, RowMetadata) -> value; defaults to
+                             clj-r2dbc.row/kebab-maps when absent.
                :chunk-size - rows per emitted vector; requires :builder-fn.
-               :qualifier  - column keyword mode used when no :builder-fn is supplied.
                :fetch-size - rows per database round-trip batch (default 128),
-                             applied to Statement.fetchSize. Flyweight mode no
-                             longer clamps this: values are materialised per row
-                             in .map (ByteBuf live), exactly like :builder-fn, so
-                             driver Row recycling after onNext is harmless.
+                             applied to Statement.fetchSize. Independent of
+                             reactive demand.
                :returning  - calls Statement.returnGeneratedValues.
 
   Connection lifecycle:
@@ -97,11 +84,9 @@
     true end-to-end streaming from database to consumer.
 
   Zero-copy:
-    Both modes materialize values inside result-row-pub's BiFunction.apply()
-    while the underlying ByteBuf is guaranteed live. With :builder-fn the builder
-    produces an immutable value; in flyweight mode (no :builder-fn) the row's
-    columns are read into a fresh Object[] wrapped in a new RowCursor. Either way
-    the emitted value owns its data and is safe to hold across deref boundaries."
+    The builder materializes its value inside result-row-pub's BiFunction.apply()
+    while the underlying ByteBuf is guaranteed live, so the emitted immutable
+    value owns its data and is safe to hold across deref boundaries."
   [db sql params opts]
   (let [[db opts]  (conn/resolve-connectable db opts)
         chunk-size (:chunk-size opts)
@@ -123,47 +108,20 @@
            (fn chunk-builder-xf [^Row row]
              (builder-fn row (.getMetadata row)))))
 
-      builder-fn
-      (lifecycle/streaming-plan-flow
-       db
-       sql
-       params
-       opts
-       (fn row-builder-xf [^Row row]
-         (builder-fn row (.getMetadata row))))
-
       :else
-      (let [meta (volatile! nil)]
-        ;; cursor-step is the row-xf, applied inside result-row-pub's .map while
-        ;; the Row's ByteBuf is live: it materialises the row's column values into
-        ;; a FRESH Object[] and emits a new immutable RowCursor per row. The
-        ;; per-result metadata (cache, name-index, RowMetadata) is built once and
-        ;; shared (immutable). Because every emission is its own value, the
-        ;; m/subscribe bridge requesting row N+1 before the consumer reads row N
-        ;; (Sub.transfer; see lifecycle) cannot corrupt an already-emitted cursor -
-        ;; the same per-row-materialisation property that makes :builder race-free.
+      ;; One row representation: the builder (defaulting to kebab-maps) is applied
+      ;; per row inside result-row-pub's .map while the ByteBuf is live, emitting a
+      ;; distinct immutable value. Because every emission is its own value, the
+      ;; m/subscribe bridge requesting row N+1 before the consumer reads row N
+      ;; (Sub.transfer; see lifecycle) can never corrupt an already-emitted value.
+      (let [bf (or builder-fn pub-row/kebab-maps)]
         (lifecycle/streaming-plan-flow
          db
          sql
          params
          opts
-         (fn cursor-step [^Row row]
-           (let [m                          (or @meta
-                                                (let [q   (:qualifier opts :unqualified-kebab)
-                                                      rmd (.getMetadata row)
-                                                      qfn (fn qualify-fn [^String col _]
-                                                            (row/qualify-column col nil q))]
-                                                  (vreset! meta
-                                                           {:cache     (row/build-metadata-cache rmd qfn)
-                                                            :name->idx (row/build-name-index rmd)
-                                                            :rmd       rmd})))
-                 ^RowMetadataCache cache    (:cache m)
-                 n                          (.col-count cache)
-                 ^"[Ljava.lang.Object;" tys (.java-types cache)
-                 vs                         (object-array n)]
-             (dotimes [i n]
-               (aset vs i (.get row (int i) ^Class (aget tys i))))
-             (cursor/->cursor vs cache (:name->idx m) (:rmd m)))))))))
+         (fn row-builder-xf [^Row row]
+           (bf row (.getMetadata row))))))))
 
 (extend-protocol proto/Streamable
   ConnectionFactory
@@ -173,15 +131,18 @@
   ConnectableWithOpts
   (-stream [db sql params opts] (stream* db sql params opts)))
 
-(defn- immutable-stream-opts
+(defn- with-default-builder
+  "Ensure opts carries a :builder-fn, defaulting to clj-r2dbc.row/kebab-maps."
   [opts]
   (assoc opts :builder-fn (:builder-fn opts pub-row/kebab-maps)))
 
 (defn stream-dispatch*
   "Dispatch stream execution from validated opts.
 
-  Resolves the builder mode (:builder-fn present vs. absent) and chunking
-  (:chunk-size present vs. absent), then delegates to stream*.
+  Installs the default builder (clj-r2dbc.row/kebab-maps) when no :builder-fn is
+  supplied, then delegates to stream*. There is one row-representation knob -
+  :builder - so both the per-row and :chunk-size paths flow through the same
+  default-builder resolution.
 
   Args:
     db   - ConnectionFactory, Connection, or ConnectableWithOpts.
@@ -192,35 +153,18 @@
   [db sql opts]
   (let [params (:params opts [])
         opts'  (dissoc opts :params)]
-    (cond (:chunk-size opts') (proto/-stream db
-                                             sql
-                                             params
-                                             (-> opts'
-                                                 immutable-stream-opts
-                                                 (dissoc :stream-mode)))
-          (= :flyweight (:stream-mode opts'))
-          (proto/-stream db sql params (dissoc opts' :stream-mode))
-          :else (proto/-stream db
-                               sql
-                               params
-                               (-> opts'
-                                   immutable-stream-opts
-                                   (dissoc :stream-mode))))))
+    (proto/-stream db sql params (with-default-builder opts'))))
 
 (comment
   (def factory (conn/create-connection-factory* {:url "r2dbc:h2:mem:///db"}))
+  ;; Default builder (kebab-maps) - no :builder-fn needed.
+  (m/? (m/reduce conj [] (stream-dispatch* factory "SELECT id FROM t" {})))
+  ;; Explicit builder.
   (m/? (m/reduce conj
                  []
                  (stream-dispatch* factory
                                    "SELECT id FROM t"
-                                   {:builder-fn clj-r2dbc.row/kebab-maps})))
-  (m/?
-   (m/reduce
-    (fn [acc crs]
-      (conj acc
-            (row/row->map (cursor/cursor-row crs) (cursor/cursor-cache crs))))
-    []
-    (stream-dispatch* factory "SELECT id FROM t" {:stream-mode :flyweight})))
+                                   {:builder-fn clj-r2dbc.row/vectors})))
   (m/? (m/reduce (fn [acc chunk] (+ acc (count chunk)))
                  0
                  (stream-dispatch* factory

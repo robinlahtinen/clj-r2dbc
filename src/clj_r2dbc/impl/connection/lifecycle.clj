@@ -41,9 +41,9 @@
 
   Uses Reactor concatMap (ordered, so multi-Result output preserves Result order)
   with prefetch 1, so row-level demand stays request(1) and no rows are buffered
-  across the bridge - preserving fetch-size-1 backpressure and flyweight-mode
-  ByteBuf safety. row-xf is applied inside each Result.map via pub/result-row-pub,
-  while the Row's backing ByteBuf is guaranteed live."
+  across the bridge - preserving fetch-size-1 backpressure. row-xf is applied
+  inside each Result.map via pub/result-row-pub, while the Row's backing ByteBuf
+  is guaranteed live, so it materialises an immutable value before emission."
   ^Publisher [^Publisher result-pub row-xf]
   (.concatMap (Flux/from result-pub)
               (reify Function
@@ -58,7 +58,7 @@
   still consumed directly by m/reduce; a transducer (m/eduction) or m/?> over the
   bridge would reintroduce the synchronous-publisher fork race (see ns docstring).
   :chunk-size requires :builder-fn, so buffered values are materialized - safe to
-  batch across the bridge (unlike flyweight Rows)."
+  batch across the bridge (raw un-materialized Rows would not be)."
   ^Publisher [^Publisher rows ^long chunk-size]
   (.map (.buffer (Flux/from rows) (int chunk-size))
         (reify Function (apply [_ batch] (vec batch)))))
@@ -123,7 +123,7 @@
     params - sequential collection of bind parameters.
     opts   - options map (see execute for supported keys).
     row-xf - 1-arity fn applied to each raw R2DBC Row to produce the emitted
-             value (identity in flyweight mode)."
+             immutable value (the builder, defaulting to kebab-maps)."
   [db sql params opts row-xf]
   (let [owns-conn?                                                       (not (instance? Connection db))
         chunk-size                                                       (:chunk-size opts)

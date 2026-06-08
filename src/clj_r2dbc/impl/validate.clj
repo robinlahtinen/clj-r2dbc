@@ -187,27 +187,6 @@
                    :min               min-value
                    :max               max-value})))))
 
-(defn require-keyword-in!
-  "Throw ex-info when key k is present in opts but not one of allowed values.
-
-  Args:
-    opts    - options map to check.
-    k       - key whose value to validate.
-    allowed - set of allowed keyword values.
-    context - keyword used as :clj-r2dbc/context in thrown ex-info.
-
-  Throws (synchronously):
-    ex-info :clj-r2dbc/invalid-value when the value is not in allowed."
-  [opts k allowed context]
-  (when-some [v (get opts k)]
-    (when-not (contains? allowed v)
-      (throw (ex-info (str k " has unsupported value")
-                      {:clj-r2dbc/error   :clj-r2dbc/invalid-value
-                       :clj-r2dbc/context context
-                       :key               k
-                       :value             v
-                       :allowed           (sort allowed)})))))
-
 (defn require-string!
   "Throw ex-info if k is absent from opts or its value is not a non-blank string."
   [opts k context]
@@ -308,7 +287,6 @@
   (let [context :clj-r2dbc/stream
         opts'   (validate-common-query-opts! opts context)]
     (require-int-range! opts' :chunk-size 1 32768 context)
-    (require-keyword-in! opts' :stream-mode #{:immutable :flyweight} context)
     opts'))
 
 (defn execute-each-opts

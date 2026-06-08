@@ -251,11 +251,10 @@
   acquired at flow invocation, released on completion, error, or cancellation.
   When db is an existing Connection, the caller owns the lifecycle.
 
-  Flyweight mode: When :stream-mode is :flyweight, the flow emits a distinct
-  immutable RowCursor per row (read its data via clj-r2dbc.row helpers within or
-  after the reduce step). It is materialized while the row's buffer is live, so
-  it is safe to read or retain - it differs from :immutable only in the shape of
-  the emitted value (a RowCursor vs. a built map).
+  Each row is emitted as one immutable value, built by :builder (default
+  clj-r2dbc.row/kebab-maps) while the row's buffer is live, so it is safe to read
+  within the reduce step or retain and read later. Choose the row shape by
+  supplying a :builder (e.g. clj-r2dbc.row/vectors for column-order vectors).
 
   Args:
     db   - ConnectionFactory, Connection, or wrapped connectable (from with-options).
@@ -271,9 +270,6 @@
                     clj-r2dbc.row/kebab-maps. Applied inside the fetch loop
                     while Row is valid. Values are safe to retain. Required
                     when using :chunk-size.
-    :stream-mode  - :immutable (default) or :flyweight.
-                    :immutable - applies :builder per row; emits immutable values.
-                    :flyweight - emits a distinct immutable RowCursor per row; see above.
     :chunk-size   - integer in [1, 32768]. Changes emission unit from individual
                     rows to java.util.ArrayList chunks of up to chunk-size
                     elements. Requires :builder. Reduces Missionary scheduler
@@ -294,14 +290,13 @@
                                        absent.
     ex-info :clj-r2dbc/invalid-type   when sql is not a string, or :builder is not
                                        a function.
-    ex-info :clj-r2dbc/invalid-value  when sql is blank, :chunk-size or :fetch-size
-                                       is out of [1, 32768], or :stream-mode is not
-                                       :immutable or :flyweight.
+    ex-info :clj-r2dbc/invalid-value  when sql is blank, or :chunk-size or
+                                       :fetch-size is out of [1, 32768].
     ex-info :clj-r2dbc/unsupported    when both :middleware and :interceptors are
                                        present.
 
   Example:
-    ;; Collect all rows (default :immutable mode)
+    ;; Collect all rows (default builder: kebab-maps)
     (m/? (m/reduce conj [] (stream db \"SELECT id, name FROM users\")))
     ;=> [{:id 1 :name \"Alice\"} {:id 2 :name \"Bob\"}]
 

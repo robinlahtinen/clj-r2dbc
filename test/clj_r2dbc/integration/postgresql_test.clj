@@ -4,48 +4,40 @@
 (ns clj-r2dbc.integration.postgresql-test
   (:require
    [clj-r2dbc :as r2dbc]
-   [clj-r2dbc.impl.sql.cursor :as cursor]
-   [clj-r2dbc.impl.sql.row :as row]
    [clj-r2dbc.integration.fixtures :as fx]
    [clojure.test :refer [deftest is testing]]
    [missionary.core :as m]))
 
 (set! *warn-on-reflection* true)
 
-(deftest ^:integration postgresql-flyweight-many-rows-test
-  ;; Regression guard for the flyweight ByteBuf use-after-free that only surfaces
-  ;; on a real Netty driver once pooled ByteBufs are recycled (the 3-row fixtures
-  ;; never trigger it). Streams many rows in flyweight mode (no :builder-fn) and
-  ;; asserts every materialised value is correct - garbage from a freed ByteBuf
-  ;; would corrupt :id/:name while keeping the row count.
+(deftest ^:integration postgresql-default-builder-many-rows-test
+  ;; Regression guard for the ByteBuf use-after-free that only surfaces on a real
+  ;; Netty driver once pooled ByteBufs are recycled (the 3-row fixtures never
+  ;; trigger it). Streams many rows with the default builder (kebab-maps, which
+  ;; materialises each row inside Result.map while the ByteBuf is live) and
+  ;; asserts every value is correct - garbage from a freed ByteBuf would corrupt
+  ;; :id/:name while keeping the row count.
   (let [db (fx/pg-db)]
     (when (fx/skip-unless-db! db "CLJ_R2DBC_TEST_PG_URL" "PostgreSQL")
-      (testing "flyweight streaming materialises correct values across ByteBuf pool reuse"
+      (testing "default-builder streaming materialises correct values across ByteBuf pool reuse"
         (let [n    20000
               sql  (str "SELECT g AS id, ('name-' || g) AS name"
                         " FROM generate_series(1, " n ") g ORDER BY g")
               rows (fx/run-task!
-                    (m/reduce (fn [acc cursor]
-                                (conj acc (row/row->map (cursor/cursor-row cursor)
-                                                        (cursor/cursor-cache cursor))))
-                              []
-                              (r2dbc/stream db sql {:params [], :stream-mode :flyweight})))]
+                    (m/reduce conj [] (r2dbc/stream db sql {:params []})))]
           (is (= n (count rows)))
           (is (= (range 1 (inc n)) (map :id rows)))
           (is (every? (fn [r] (= (str "name-" (:id r)) (:name r))) rows))))
-      (testing "flyweight cursors are per-row immutable: retained and read after the stream"
-        ;; Retains every emitted cursor, then materialises them only AFTER the
-        ;; stream completes. A shared/recycled cursor would return the last row n
-        ;; times (or freed-ByteBuf garbage); per-row isolation makes it correct -
-        ;; the real-Netty guard for the request-ahead corruption (CI [2 2 3]).
-        (let [n       5000
-              sql     (str "SELECT g AS id, ('name-' || g) AS name"
-                           " FROM generate_series(1, " n ") g ORDER BY g")
-              cursors (fx/run-task!
-                       (m/reduce conj []
-                                 (r2dbc/stream db sql {:params [], :stream-mode :flyweight})))
-              rows    (mapv #(row/row->map (cursor/cursor-row %) (cursor/cursor-cache %))
-                            cursors)]
+      (testing "emitted rows are immutable per row: retained and read after the stream"
+        ;; Retains every emitted value, then reads it only AFTER the stream
+        ;; completes. Freed-ByteBuf garbage or a shared/recycled value would
+        ;; corrupt the data; per-row materialisation makes it correct - the
+        ;; real-Netty guard for the request-ahead corruption (CI [2 2 3]).
+        (let [n    5000
+              sql  (str "SELECT g AS id, ('name-' || g) AS name"
+                        " FROM generate_series(1, " n ") g ORDER BY g")
+              rows (fx/run-task!
+                    (m/reduce conj [] (r2dbc/stream db sql {:params []})))]
           (is (= n (count rows)))
           (is (= (range 1 (inc n)) (map :id rows)))
           (is (every? (fn [r] (= (str "name-" (:id r)) (:name r))) rows)))))))

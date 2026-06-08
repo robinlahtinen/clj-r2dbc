@@ -15,7 +15,6 @@
    [clj-r2dbc.impl.connection.lifecycle :as life]
    [clj-r2dbc.impl.datafy :as datafy-impl]
    [clj-r2dbc.impl.execute.stream :as stream]
-   [clj-r2dbc.impl.sql.cursor :as cursor]
    [clj-r2dbc.impl.sql.row :as row]
    [clj-r2dbc.impl.sql.statement :as stmt]
    [clj-r2dbc.impl.util :as util]
@@ -24,7 +23,6 @@
    [clojure.test :refer [deftest is testing use-fixtures]]
    [missionary.core :as m])
   (:import
-   (clj_r2dbc.impl.sql.cursor RowCursor)
    (io.r2dbc.spi Connection Row Statement)))
 
 (set! *warn-on-reflection* true)
@@ -110,45 +108,26 @@
       (is (= 3 (count rows)))
       (is (= 3 (count (into #{} (map #(System/identityHashCode %) rows))))))))
 
-(deftest plan-cursor-flyweight-distinct-instance-test
+(deftest plan-default-builder-kebab-maps-test
   (testing
-   "without :builder-fn, each row is emitted as a distinct immutable RowCursor"
-    (let [cf      (get-factory)
-          cursors (db/run-task!
-                   (m/reduce conj [] (stream/stream* cf select-all [] {})))]
-      (is (= 3 (count cursors)))
-      (is (every? #(instance? RowCursor %) cursors))
-      (is (= 3 (count (into #{} (map #(System/identityHashCode %) cursors))))
-          "each row yields its own cursor instance, never a shared/recycled one"))))
-
-(deftest plan-cursor-read-immediately-test
-  (testing
-   "RowCursor data is correct when materialised immediately within each m/reduce step"
+   "without :builder-fn, stream* defaults to kebab-maps and emits one immutable
+   map per row, in order - the single row representation after :flyweight removal"
     (let [cf   (get-factory)
-          rows (db/run-task! (m/reduce (fn [acc cursor]
-                                         (conj acc
-                                               (row/row->map
-                                                (cursor/cursor-row cursor)
-                                                (cursor/cursor-cache cursor))))
-                                       []
-                                       (stream/stream* cf select-all [] {})))]
+          rows (db/run-task!
+                (m/reduce conj [] (stream/stream* cf select-all [] {})))]
       (is (= 3 (count rows)))
-      (is (= 1 (:id (first rows))))
-      (is (= "Alice" (:name (first rows))))
-      (is (= 2 (:id (second rows))))
-      (is (= 3 (:id (nth rows 2)))))))
+      (is (every? map? rows))
+      (is (= [1 2 3] (mapv :id rows)))
+      (is (= ["Alice" "Bob" "Carol"] (mapv :name rows))))))
 
-(deftest ^:pattern-1 plan-cursor-retention-safe-test
+(deftest ^:pattern-1 plan-default-builder-retention-safe-test
   (testing
-   "flyweight cursors are immutable per row: retaining every cursor and reading
-   it only after the stream completes still yields correct per-row data (the
-   shared-mutable hazard is gone). This is the regression guard for the
-   request-ahead corruption that surfaced on the 2-core CI runner."
-    (let [cf      (get-factory)
-          cursors (db/run-task!
-                   (m/reduce conj [] (stream/stream* cf select-all [] {})))
-          rows    (mapv #(row/row->map (cursor/cursor-row %) (cursor/cursor-cache %))
-                        cursors)]
+   "default-builder rows are immutable per row: retaining every emitted value and
+   reading it only after the stream completes still yields correct per-row data.
+   Regression guard for the request-ahead corruption seen on the 2-core CI runner."
+    (let [cf   (get-factory)
+          rows (db/run-task!
+                (m/reduce conj [] (stream/stream* cf select-all [] {})))]
       (is (= 3 (count rows)))
       (is (= [1 2 3] (mapv :id rows)))
       (is (= ["Alice" "Bob" "Carol"] (mapv :name rows))))))
