@@ -79,16 +79,22 @@
   consumer's thread.
 
   Why subscribeOn, and why it is required for correctness (not just thread
-  placement): a *synchronous* Publisher (H2 in-memory, Reactor scalar fusion)
-  emits onNext re-entrantly from inside the consumer's request(n) call. When that
-  consumer is Missionary's m/subscribe being forked by m/?> (Ambiguous), the
-  re-entrant signal races the fork: it either throws ClassCastException mid-fork
-  (notifier fires before the iterator is assigned) or, under concurrent load,
-  drops a wakeup and parks the flow forever. subscribeOn moves the subscription
-  and the whole request->onNext cascade onto a blk thread, so the cascade no
-  longer re-enters the consumer's request frame. An async driver (Netty-based
-  Postgres/MariaDB) never emits during request and is unaffected; this boundary
-  exists for the synchronous case but is applied uniformly.
+  placement): a *synchronous* Publisher (H2 in-memory: H2Statement.execute builds
+  results from Flux.fromIterable/Mono.fromSupplier with no Scheduler) emits onNext
+  on the consumer's own request thread. Missionary's m/subscribe drops the element
+  just before onComplete in that case (its Sub bridge is request(1)-driven and
+  built for asynchronous publishers; verified: (m/reduce conj [] (m/subscribe
+  (Flux/range 1 3))) => [1 3]). subscribeOn moves the subscription and the whole
+  request->onNext cascade onto a blk thread, restoring the asynchrony m/subscribe
+  expects, so no element is dropped.
+
+  IMPORTANT - applied ONLY to synchronous drivers. An async driver (Netty-based
+  Postgres/MariaDB) emits onNext on its own event-loop thread; wrapping it here
+  adds a second requester thread that races that event loop and REORDERS rows
+  (observed: one row displaced ~13 positions over a 20k stream). lifecycle
+  interposes this wrapper only when synchronous-db? (a cached re-entrancy probe,
+  see synchronous-emission?) reports a synchronous driver; asynchronous drivers
+  are consumed bare.
 
   subscribeOn is deliberately chosen over publishOn: publishOn inserts a prefetch
   queue (default 256) that defeats the request(1)/fetchSize-1 backpressure this
@@ -101,6 +107,50 @@
   Returns a Publisher decoupled from the consumer's thread via subscribeOn."
   ^Publisher [^Publisher pub]
   (.subscribeOn (Flux/from pub) blk-scheduler))
+
+(defn synchronous-emission?
+  "Probe whether pub emits its first item on the thread that subscribed.
+
+  Returns true when the first onNext arrives on the SAME thread that called
+  onSubscribe/request - the signature of a synchronous publisher that runs on
+  the caller's thread (e.g. R2DBC H2, whose H2Statement.execute builds results
+  from Flux.fromIterable / Mono.fromSupplier with no Scheduler). Returns false
+  when the first item arrives on a different thread (an asynchronous, Netty-backed
+  driver such as PostgreSQL/MariaDB), or when the publisher completes empty or
+  errors before emitting.
+
+  Why this matters: a synchronous publisher delivers onNext on the consumer's
+  request thread, and missionary's m/subscribe drops the element just before
+  onComplete in that case (its Sub bridge is request(1)-driven and built for
+  asynchronous publishers; verified: (m/reduce conj [] (m/subscribe (Flux/range
+  1 3))) => [1 3]). Callers use this probe to decide whether to interpose
+  async-subscribe-pub (which moves emission onto m/blk, restoring the asynchrony
+  m/subscribe expects). Asynchronous drivers must NOT get that wrapper - the
+  extra requester thread races their event loop and reorders rows.
+
+  Blocking and one-shot: subscribes, requests one item, blocks the calling
+  thread until the first signal, then cancels. Intended to be run once per
+  driver and cached (see lifecycle/synchronous-db?).
+
+  Args:
+    pub - Publisher to probe (a representative query such as SELECT 1)."
+  [^Publisher pub]
+  (let [fut        (CompletableFuture.)
+        sub-ref    (volatile! nil)
+        sub-thread (volatile! nil)]
+    (.subscribe pub
+                (reify
+                  Subscriber
+                  (onSubscribe [_ s]
+                    (vreset! sub-ref s)
+                    (vreset! sub-thread (Thread/currentThread))
+                    (.request ^Subscription s 1))
+                  (onNext [_ _]
+                    (.complete fut (identical? @sub-thread (Thread/currentThread)))
+                    (.cancel ^Subscription @sub-ref))
+                  (onError [_ _] (.complete fut false))
+                  (onComplete [_] (.complete fut false))))
+    (.get ^CompletableFuture fut)))
 
 (defn first-pub-blocking
   "Subscribe to pub, request one item, and return it synchronously.

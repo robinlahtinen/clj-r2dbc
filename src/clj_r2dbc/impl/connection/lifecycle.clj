@@ -15,6 +15,14 @@
   bridged to a single Missionary discrete flow with m/subscribe. The flow is
   consumed by the caller's m/reduce (a non-forking consumer).
 
+  Decoupling is conditional on the driver (see synchronous-db?): a SYNCHRONOUS
+  driver (H2 in-memory, emitting on the consumer's request thread) is wrapped with
+  pub/async-subscribe-pub so emission moves to m/blk - m/subscribe drops the
+  element before onComplete from a synchronous publisher otherwise. An ASYNCHRONOUS
+  driver (Netty PostgreSQL/MariaDB) is consumed BARE; wrapping it would add a
+  second requester thread that reorders rows. Synchronicity is probed once per
+  driver and cached.
+
   Why not m/?> over m/subscribe: forking a discrete flow built from m/subscribe
   with m/?> (Ambiguous) races a synchronous publisher's re-entrant onNext against
   the fork and intermittently drops a wakeup, hanging the flow under concurrency
@@ -29,7 +37,9 @@
    [clj-r2dbc.impl.sql.statement :as stmt]
    [missionary.core :as m])
   (:import
-   (io.r2dbc.spi Connection ConnectionFactory Statement)
+   (io.r2dbc.spi Connection ConnectionFactory ConnectionFactoryMetadata
+                 ConnectionMetadata Statement)
+   (java.util.concurrent ConcurrentHashMap)
    (java.util.function Function Supplier)
    (org.reactivestreams Publisher)
    (reactor.core.publisher Flux)))
@@ -98,24 +108,96 @@
   (m/subscribe
    (pub/async-subscribe-pub (chunked-pub (rows-pub result-pub row-xf) chunk-size))))
 
+(defn- build-streaming-publisher
+  "Build the row Publisher consumed by the Missionary bridge.
+
+  When db is a ConnectionFactory, Reactor Flux/usingWhen acquires the connection
+  on subscription and closes it on completion/error/cancellation (close() runs
+  exactly once on any terminal signal). When db is already a Connection, the
+  caller owns the lifecycle and close() is NOT called (Flux/defer). In both cases
+  the Statement is prepared/executed and rows-pub concatMaps each Result's rows;
+  when opts carries :chunk-size the rows are batched into vectors via chunked-pub.
+
+  Args:
+    db     - ConnectionFactory or Connection (already resolved).
+    sql    - SQL string to execute.
+    params - sequential collection of bind parameters.
+    opts   - options map (see execute for supported keys).
+    row-xf - 1-arity fn [Row] -> emitted immutable value."
+  ^Publisher [db sql params opts row-xf]
+  (let [chunk-size (:chunk-size opts)
+        use-fn     (reify Function
+                     (apply [_ conn]
+                       (let [rows (rows-pub (.execute ^Statement
+                                             (stmt/prepare! conn sql params opts))
+                                            row-xf)]
+                         (if chunk-size (chunked-pub rows (long chunk-size)) rows))))]
+    (if (instance? Connection db)
+      (Flux/defer (reify Supplier (get [_] (.apply use-fn db))))
+      (Flux/usingWhen (.create ^ConnectionFactory db)
+                      use-fn
+                      (reify Function
+                        (apply [_ conn] (.close ^Connection conn)))))))
+
+(defn- driver-key
+  "Stable per-driver cache key for synchronous-db?: the R2DBC product/driver name
+  (e.g. \"H2\", \"PostgreSQL\"). Synchronicity is a property of the driver, so a
+  single probe per name serves every factory/connection of that driver."
+  [db]
+  (cond
+    (instance? Connection db)
+    (.getDatabaseProductName ^ConnectionMetadata (.getMetadata ^Connection db))
+    (instance? ConnectionFactory db)
+    (.getName ^ConnectionFactoryMetadata (.getMetadata ^ConnectionFactory db))
+    :else (.getName ^Class (class db))))
+
+(defonce ^:private ^ConcurrentHashMap synchronicity-cache (ConcurrentHashMap.))
+
+(defn- synchronous-db?
+  "Return true if db's driver emits result rows on the subscriber's own thread
+  (a synchronous driver such as H2 in-memory) rather than on its own event loop
+  (an asynchronous Netty driver such as PostgreSQL/MariaDB).
+
+  Probed ONCE per driver via pub/synchronous-emission? over a representative
+  SELECT 1, then cached by driver name. The result decides whether
+  streaming-plan-flow interposes pub/async-subscribe-pub: synchronous drivers
+  need it (m/subscribe drops the penultimate element of a synchronous publisher);
+  asynchronous drivers must NOT get it (the extra requester thread reorders rows).
+  The first stream per driver blocks briefly on the probe; all later streams hit
+  the cache. Caveat: if the first stream for a driver is on a caller-owned
+  Connection (with-connection/with-transaction) with a cold cache, the probe runs
+  its SELECT 1 on that connection (then cancels) - one extra read, harmless for a
+  plain query but worth knowing inside a transaction."
+  [db]
+  (.computeIfAbsent
+   synchronicity-cache
+   (driver-key db)
+   (reify Function
+     (apply [_ _]
+       (pub/synchronous-emission?
+        (build-streaming-publisher db "SELECT 1" [] {} (fn [_row] true)))))))
+
 (defn streaming-plan-flow
   "Return a Missionary discrete flow emitting transformed rows with end-to-end
   demand-driven backpressure and managed connection lifecycle.
 
   Connection lifecycle: when db is a ConnectionFactory, the connection is
   acquired on subscription and closed on completion/error/cancellation via
-  Reactor Flux/usingWhen (which cancels create()/execute() and runs
-  Connection.close() exactly once on any terminal signal). When db is already a
-  Connection, the caller owns the lifecycle and close() is NOT called.
+  Reactor Flux/usingWhen. When db is already a Connection, the caller owns the
+  lifecycle and close() is NOT called. See build-streaming-publisher.
 
-  The row Publisher is built below the Missionary bridge: usingWhen acquires the
-  connection, prepares and executes the Statement, and rows-pub concatMaps each
-  Result's rows; the resulting Publisher is bridged once with m/subscribe
-  (dispatched on m/blk). The caller consumes the flow with m/reduce/m/eduction -
-  there is no m/?> over the bridge, by design (see ns docstring). Statement
-  fetchSize (applied from opts in stmt/prepare!) controls database fetch batching.
-  When opts carries :chunk-size, rows are batched into vectors below the bridge
-  via chunked-pub (Reactor buffer).
+  The row Publisher is bridged to a single discrete flow with m/subscribe and
+  consumed by the caller's m/reduce/m/eduction - never m/?> over the bridge (see
+  ns docstring). Statement fetchSize (from opts in stmt/prepare!) controls
+  database fetch batching; :chunk-size batches rows into vectors below the bridge.
+
+  Decoupling is conditional on the driver's emission model (synchronous-db?,
+  cached per driver): a SYNCHRONOUS driver (H2) emits on the consumer's request
+  thread, which m/subscribe mishandles (drops the element before onComplete), so
+  the Publisher is wrapped with pub/async-subscribe-pub to emit on m/blk instead.
+  An ASYNCHRONOUS driver (Netty PostgreSQL/MariaDB) already emits on its event
+  loop and is consumed BARE - wrapping it would add a competing requester thread
+  that reorders rows.
 
   Args:
     db     - ConnectionFactory or Connection (ConnectableWithOpts must be
@@ -126,23 +208,10 @@
     row-xf - 1-arity fn applied to each raw R2DBC Row to produce the emitted
              immutable value (the builder, defaulting to kebab-maps)."
   [db sql params opts row-xf]
-  (let [owns-conn?                                                       (not (instance? Connection db))
-        chunk-size                                                       (:chunk-size opts)
-        use-fn                                                           (reify Function
-                                                                           (apply [_ conn]
-                                                                             (let [rows (rows-pub (.execute ^Statement
-                                                                                                   (stmt/prepare! conn sql params opts))
-                                                                                                  row-xf)]
-                                                                               (if chunk-size (chunked-pub rows (long chunk-size)) rows))))
-        ^Publisher pub
-        (if owns-conn?
-          (Flux/usingWhen (.create ^ConnectionFactory db)
-                          use-fn
-                          (reify Function
-                            (apply [_ conn] (.close ^Connection conn))))
-          (Flux/defer (reify Supplier
-                        (get [_] (.apply use-fn db)))))]
-    (m/subscribe (pub/async-subscribe-pub pub))))
+  (let [pub (build-streaming-publisher db sql params opts row-xf)]
+    (if (synchronous-db? db)
+      (m/subscribe (pub/async-subscribe-pub pub))
+      (m/subscribe pub))))
 
 (comment
   (require '[clj-r2dbc :as r2])
