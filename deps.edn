@@ -7,7 +7,7 @@
                          :url  "https://github.com/robinlahtinen/clj-r2dbc/blob/main/LICENSE"}}
  :deps    {org.clojure/clojure                 {:mvn/version "1.12.5"}
            io.r2dbc/r2dbc-spi                  {:mvn/version "1.0.0.RELEASE"}
-           io.projectreactor/reactor-core      {:mvn/version "3.8.5"}
+           io.projectreactor/reactor-core      {:mvn/version "3.8.6"}
            missionary/missionary               {:mvn/version "b.47"}
            camel-snake-kebab/camel-snake-kebab {:mvn/version "0.4.3"}
            com.taoensso/trove                  {:mvn/version "1.1.0"}}
