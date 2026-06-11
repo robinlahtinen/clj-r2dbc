@@ -42,9 +42,10 @@
   (if-let [builder (:builder-fn opts)]
     (do (when-not (fn? builder)
           (throw (ex-info "Invalid :builder-fn; expected function"
-                          {:clj-r2dbc/error-type :invalid-argument
-                           :key                  :builder-fn
-                           :value                (type builder)})))
+                          {:clj-r2dbc/error   :clj-r2dbc/invalid-type
+                           :clj-r2dbc/context :clj-r2dbc/execute
+                           :key               :builder-fn
+                           :value             (type builder)})))
         (fn row-builder [^Row r] (builder r (.getMetadata r))))
     (let [q         (:qualifier opts :unqualified-kebab)
           cache-ref (volatile! nil)]

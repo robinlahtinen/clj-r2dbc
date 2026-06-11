@@ -153,9 +153,10 @@
                   (throw
                    (ex-info
                     "Invalid :max-interceptor-depth; must be a positive integer"
-                    {:clj-r2dbc/error-type :invalid-argument
-                     :key                  :max-interceptor-depth
-                     :value                user-val})))
+                    {:clj-r2dbc/error   :clj-r2dbc/invalid-value
+                     :clj-r2dbc/context :clj-r2dbc/pipeline
+                     :key               :max-interceptor-depth
+                     :value             user-val})))
                 (long user-val))
             (long max-interceptor-depth))]
       (when (> interceptor-count max-depth)

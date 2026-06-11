@@ -27,9 +27,10 @@
   (let [threshold (long lob-threshold-bytes)]
     (when-not (pos? threshold)
       (throw (ex-info "Invalid :lob-threshold-bytes; must be positive"
-                      {:clj-r2dbc/error-type :invalid-argument
-                       :key                  :lob-threshold-bytes
-                       :value                lob-threshold-bytes})))
+                      {:clj-r2dbc/error   :clj-r2dbc/invalid-value
+                       :clj-r2dbc/context :clj-r2dbc/oracle
+                       :key               :lob-threshold-bytes
+                       :value             lob-threshold-bytes})))
     {:name                                                                    ::lob-handler
      :enter
      (fn [ctx]

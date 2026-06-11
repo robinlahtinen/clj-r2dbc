@@ -34,7 +34,9 @@
   (:require
    [clj-r2dbc.impl.connection :as conn]
    [clj-r2dbc.impl.connection.lifecycle :as lifecycle]
+   [clj-r2dbc.impl.datafy :as datafy-impl]
    [clj-r2dbc.impl.protocols :as proto]
+   [clj-r2dbc.impl.sql.reduce :as reduce]
    [clj-r2dbc.row :as pub-row]
    [missionary.core :as m])
   (:import
@@ -47,25 +49,33 @@
 (defn stream*
   "Return a Missionary flow that emits one immutable value per row returned by sql.
 
-  The row value is produced by :builder-fn (fn [Row RowMetadata] -> value),
-  applied per row inside result-row-pub's BiFunction while the Row's ByteBuf is
-  live. When :builder-fn is absent it defaults to clj-r2dbc.row/kebab-maps, so a
-  no-builder call emits standard kebab-case row maps. Every emission is an
+  The row value is produced by a row builder, applied per row inside
+  result-row-pub's BiFunction while the Row's ByteBuf is live. The builder is
+  selected from :builder-fn (if supplied), or from :qualifier (if supplied, via
+  reduce/make-row-fn). When neither is supplied, defaults to
+  clj-r2dbc.row/kebab-maps (unqualified kebab-case maps). Every emission is an
   immutable value, safe to read within the reduce step or retain and read later.
+
+  With :datafy true, each row has Datafiable metadata attached for REPL navigation.
 
   With :chunk-size - emits one vector of up to chunk-size built values per
   emission (the final vector may be shorter). :chunk-size only changes the
   emission unit, not the row representation: it uses the same builder as the
-  per-row path (default kebab-maps). Batching happens below the bridge (Reactor
-  buffer), so the consumer performs O(batches) transfers.
+  per-row path. Batching happens below the bridge (Reactor buffer), so the
+  consumer performs O(batches) transfers.
 
   Args:
     db     - ConnectionFactory, Connection, or ConnectableWithOpts.
     sql    - SQL string.
     params - sequential bind parameters.
     opts   - options map:
-               :builder-fn - 2-arity (Row, RowMetadata) -> value; defaults to
-                             clj-r2dbc.row/kebab-maps when absent.
+               :builder-fn - 2-arity (Row, RowMetadata) -> value; takes
+                             priority over :qualifier if both supplied.
+               :qualifier  - mode keyword (:unqualified, :unqualified-kebab,
+                             :qualified-kebab); passed to reduce/make-row-fn;
+                             ignored if :builder-fn supplied.
+               :datafy     - boolean; when true, attaches Datafiable metadata
+                             for REPL navigation (default false).
                :chunk-size - rows per emitted vector; uses the same builder as
                              the per-row path.
                :fetch-size - rows per database round-trip batch (default 128),
@@ -92,16 +102,20 @@
   [db sql params opts]
   (let [[db opts]  (conn/resolve-connectable db opts)
         chunk-size (:chunk-size opts)
-        bf         (or (:builder-fn opts) pub-row/kebab-maps)
-        ;; The builder (defaulting to kebab-maps) is applied per row inside
-        ;; result-row-pub's .map while the ByteBuf is live, so every emission is a
-        ;; distinct immutable value - the m/subscribe bridge requesting row N+1
-        ;; before the consumer reads row N (Sub.transfer; see lifecycle) can never
-        ;; corrupt an already-emitted value. :chunk-size and :builder are
-        ;; orthogonal: chunking only changes the emission unit (a Reactor buffer
-        ;; below the bridge groups built values into vectors), not the builder.
-        row-xf     (fn row-builder-xf [^Row row]
-                     (bf row (.getMetadata row)))]
+        base-fn    (reduce/make-row-fn opts)
+        ;; make-row-fn returns a 1-arity (Row -> value) that honors both
+        ;; :builder-fn (if supplied) and :qualifier (if supplied). If neither are
+        ;; present, it defaults to :unqualified-kebab (same as pub-row/kebab-maps).
+        ;; The base-fn is applied per row inside result-row-pub's .map while the
+        ;; ByteBuf is live. If :datafy is true, wrap the result with
+        ;; attach-datafiable-meta for REPL navigation support. :chunk-size and
+        ;; :builder/:qualifier are orthogonal: chunking only changes the emission
+        ;; unit (a Reactor buffer below the bridge groups built values into
+        ;; vectors), not the row representation.
+        row-xf     (if (:datafy opts)
+                     (fn row-builder-xf [^Row row]
+                       (datafy-impl/attach-datafiable-meta (base-fn row) db opts))
+                     base-fn)]
     (if chunk-size
       (lifecycle/streaming-plan-flow
        db sql params (assoc opts :fetch-size (long chunk-size)) row-xf)
@@ -116,18 +130,14 @@
   ConnectableWithOpts
   (-stream [db sql params opts] (stream* db sql params opts)))
 
-(defn- with-default-builder
-  "Ensure opts carries a :builder-fn, defaulting to clj-r2dbc.row/kebab-maps."
-  [opts]
-  (assoc opts :builder-fn (:builder-fn opts pub-row/kebab-maps)))
-
 (defn stream-dispatch*
   "Dispatch stream execution from validated opts.
 
-  Installs the default builder (clj-r2dbc.row/kebab-maps) when no :builder-fn is
-  supplied, then delegates to stream*. There is one row-representation knob -
-  :builder - so both the per-row and :chunk-size paths flow through the same
-  default-builder resolution.
+  Delegates to stream*, which honors :builder-fn and :qualifier for row
+  representation, :datafy for Datafiable metadata attachment, and :chunk-size
+  for batching. Default row representation (when neither :builder-fn nor
+  :qualifier supplied) is unqualified kebab-case maps (same as
+  clj-r2dbc.row/kebab-maps).
 
   Args:
     db   - ConnectionFactory, Connection, or ConnectableWithOpts.
@@ -138,7 +148,7 @@
   [db sql opts]
   (let [params (:params opts [])
         opts'  (dissoc opts :params)]
-    (proto/-stream db sql params (with-default-builder opts'))))
+    (proto/-stream db sql params opts')))
 
 (comment
   (def factory (conn/create-connection-factory* {:url "r2dbc:h2:mem:///db"}))

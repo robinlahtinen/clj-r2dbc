@@ -244,9 +244,10 @@
     (when (or (nil? ns-name) (.isEmpty ^String ns-name))
       (throw (ex-info
               "Invalid :qualifier; expected non-empty string/keyword/symbol"
-              {:clj-r2dbc/error-type :invalid-argument
-               :key                  :qualifier
-               :value                resolved})))
+              {:clj-r2dbc/error   :clj-r2dbc/invalid-type
+               :clj-r2dbc/context :clj-r2dbc/row-builder
+               :key               :qualifier
+               :value             resolved})))
     (keyword ns-name (col-xf col-name))))
 
 (defn ensure-qualifier
@@ -263,9 +264,10 @@
   (let [q (:qualifier opts)]
     (when-not q
       (throw (ex-info "Missing required :qualifier"
-                      {:clj-r2dbc/error-type :invalid-argument
-                       :key                  :qualifier
-                       :value                nil})))
+                      {:clj-r2dbc/error   :clj-r2dbc/missing-key
+                       :clj-r2dbc/context :clj-r2dbc/row-builder
+                       :key               :qualifier
+                       :value             nil})))
     q))
 
 (comment

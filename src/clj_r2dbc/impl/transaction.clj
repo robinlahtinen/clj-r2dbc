@@ -48,10 +48,10 @@
         isolation     (when isolation-key
                         (or (get isolation-map isolation-key)
                             (throw (ex-info "Invalid transaction isolation"
-                                            {:clj-r2dbc/error-type
-                                             :invalid-argument
-                                             :key                  :isolation
-                                             :value                isolation-key}))))]
+                                            {:clj-r2dbc/error   :clj-r2dbc/invalid-value
+                                             :clj-r2dbc/context :clj-r2dbc/transaction
+                                             :key               :isolation
+                                             :value             isolation-key}))))]
     (reify
       TransactionDefinition
       (getAttribute [_ attr]

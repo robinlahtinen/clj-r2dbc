@@ -37,9 +37,10 @@
   [{:keys [json->clj]}]
   (when-not (fn? json->clj)
     (throw (ex-info "pg-json-interceptor requires :json->clj function"
-                    {:clj-r2dbc/error-type :invalid-argument
-                     :key                  :json->clj
-                     :value                json->clj})))
+                    {:clj-r2dbc/error   :clj-r2dbc/invalid-type
+                     :clj-r2dbc/context :clj-r2dbc/postgresql
+                     :key               :json->clj
+                     :value             json->clj})))
   (let
    [{:keys [json-class as-string]}
     (or
@@ -47,8 +48,9 @@
      (throw
       (ex-info
        "PostgreSQL Json codec class not found; add io.r2dbc/r2dbc-postgresql to classpath"
-       {:clj-r2dbc/error-type :missing-dependency
-        :dependency           "io.r2dbc/r2dbc-postgresql"})))]
+       {:clj-r2dbc/error   :clj-r2dbc/missing-dependency
+        :clj-r2dbc/context :clj-r2dbc/postgresql
+        :dependency        "io.r2dbc/r2dbc-postgresql"})))]
     {:name  ::pg-json
      :leave (fn [ctx]
               (update ctx
