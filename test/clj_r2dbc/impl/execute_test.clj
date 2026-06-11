@@ -365,7 +365,7 @@
            (is false "should have thrown")
            (catch ExceptionInfo e
              (is (= {:clj-r2dbc/error   :clj-r2dbc/limit-exceeded
-                     :clj-r2dbc/context :execute-each
+                     :clj-r2dbc/context :clj-r2dbc/execute-each
                      :key               :param-sets
                      :constraint        :max-batch-size
                      :limit             10000

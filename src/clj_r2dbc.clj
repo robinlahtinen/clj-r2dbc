@@ -235,9 +235,9 @@
     (m/? (first-row db \"SELECT 1 WHERE false\"))
     ;=> nil"
   ([db sql & {:as opts}]
-   (v/require-non-nil! db "db" :clj-r2dbc/execute)
-   (v/require-non-blank-string! sql "sql" :clj-r2dbc/execute)
-   (let [opts'     (v/execute-opts (or opts {}) :clj-r2dbc/execute)
+   (v/require-non-nil! db "db" :clj-r2dbc/first-row)
+   (v/require-non-blank-string! sql "sql" :clj-r2dbc/first-row)
+   (let [opts'     (v/execute-opts (or opts {}) :clj-r2dbc/first-row)
          params    (:params opts' [])
          call-opts (dissoc opts' :params)]
      (proto/-execute-one db sql params call-opts))))
@@ -525,9 +525,10 @@
    (v/require-fn-val! f "f" :clj-r2dbc/with-transaction)
    (proto/-with-connection db
                            (fn [conn]
-                             (((middleware/with-transaction (or opts {}))
-                               (fn [_ctx] (f {:connection conn})))
-                              {:r2dbc/connection conn})))))
+                             (let [tx-mw   (middleware/with-transaction (or opts {}))
+                                   exec-fn (fn [_ctx] (f {:connection conn}))
+                                   ctx     {:r2dbc/connection conn}]
+                               ((tx-mw exec-fn) ctx))))))
 
 (defmacro ^{:added "0.1"} with-conn
   "Macro. Acquire a connection, bind it to conn, and run body as a Missionary task.

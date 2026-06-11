@@ -185,7 +185,7 @@
                              (ex-info
                               "Invalid :max-batch-size; must be a positive integer"
                               {:clj-r2dbc/error   :clj-r2dbc/invalid-value
-                               :clj-r2dbc/context :execute-each
+                               :clj-r2dbc/context :clj-r2dbc/execute-each
                                :key               :max-batch-size
                                :value             user-val})))
                           (long user-val))
@@ -193,7 +193,7 @@
       (when (> set-count limit)
         (throw (ex-info "execute-each!* param-set count exceeds max-batch-size"
                         {:clj-r2dbc/error   :clj-r2dbc/limit-exceeded
-                         :clj-r2dbc/context :execute-each
+                         :clj-r2dbc/context :clj-r2dbc/execute-each
                          :key               :param-sets
                          :constraint        :max-batch-size
                          :limit             limit
@@ -235,7 +235,7 @@
   Returns a Missionary task resolving to {:clj-r2dbc/update-counts [...]}.
   Row segments from batch results are silently discarded."
   [db sql-stmts _opts]
-  (let [[db _opts] (conn/resolve-connectable db _opts)]
+  (let [[db] (conn/resolve-connectable db _opts)]
     (conn/with-connection*
       db
       (fn [^Connection conn]

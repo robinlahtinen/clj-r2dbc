@@ -9,6 +9,7 @@
 
   This namespace is an implementation detail; do not use from application code."
   (:require
+   [clj-r2dbc.impl.util :as util]
    [clojure.core.protocols :as core-p]
    [missionary.core :as m])
   (:import
@@ -25,8 +26,6 @@
 (def nav-fn-key ::nav-fn)
 
 (def ^:private default-nav-timeout-ms 5000)
-
-(defn- to-task [result] (if (fn? result) result (m/sp result)))
 
 (defn attach-datafiable-meta
   "Attach Datafiable metadata to a realized row value.
@@ -72,11 +71,11 @@
               marked? (true? (marker-key md))
               nav-fn  (nav-fn-key md)]
           (if (and marked? (fn? nav-fn))
-            (m/? (to-task (nav-fn {:connectable (connectable-key md)
-                                   :row         row
-                                   :k           k
-                                   :v           v
-                                   :opts        (merge (opts-key md {}) opts)})))
+            (m/? (util/to-task (nav-fn {:connectable (connectable-key md)
+                                        :row         row
+                                        :k           k
+                                        :v           v
+                                        :opts        (merge (opts-key md {}) opts)})))
             nil))))
 
 (defn navigate-blocking
