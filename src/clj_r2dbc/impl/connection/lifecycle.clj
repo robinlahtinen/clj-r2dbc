@@ -151,7 +151,13 @@
     (.getName ^ConnectionFactoryMetadata (.getMetadata ^ConnectionFactory db))
     :else (.getName ^Class (class db))))
 
-(defonce ^:private ^ConcurrentHashMap synchronicity-cache (ConcurrentHashMap.))
+(def ^:private ^ConcurrentHashMap synchronicity-cache
+  "Per-driver synchronicity probe results (driver name -> Boolean), populated
+  lazily by synchronous-db?. A plain def keeps AOT output deterministic - it
+  bakes no instance into the compiled class (the map is built at namespace load,
+  not compile time) and resolves no var at runtime. A fresh map per JVM is
+  correct; re-probing after a REPL reload is harmless."
+  (ConcurrentHashMap.))
 
 (defn- synchronous-db?
   "Return true if db's driver emits result rows on the subscriber's own thread
